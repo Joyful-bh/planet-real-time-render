@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taichi-planet-renderer"
+version = "0.1.0"
+description = "从地表无缝飞到太空的 Taichi 单行星实时渲染器"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["taichi>=1.7,<2", "numpy>=1.24"]
+
+[project.scripts]
+planet-render = "planet_renderer.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
