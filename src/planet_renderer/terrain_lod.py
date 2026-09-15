@@ -10,12 +10,17 @@ from .terrain_types import PatchKey
 
 
 def cube_face_direction(face: int, u: float, v: float) -> Vec3d:
+    return normalize(cube_face_vector(face,u,v))
+
+
+def cube_face_vector(face:int,u:float,v:float)->Vec3d:
     mappings = ((1.,v,-u),(-1.,v,u),(u,1.,-v),(u,-1.,v),(u,v,1.),(-u,v,-1.))
-    return normalize(np.asarray(mappings[face], np.float64))
+    return np.asarray(mappings[face],np.float64)
 
 
 def direction_to_cube_face_uv(direction: Vec3d) -> tuple[int,float,float]:
-    x,y,z=normalize(direction); ax,ay,az=abs(x),abs(y),abs(z)
+    x,y,z=direction;ax,ay,az=abs(x),abs(y),abs(z)
+    if max(ax,ay,az)<=1e-30:raise ValueError("direction must be non-zero")
     if ax>=ay and ax>=az: return (0,-z/ax,y/ax) if x>=0 else (1,z/ax,y/ax)
     if ay>=ax and ay>=az: return (2,x/ay,-z/ay) if y>=0 else (3,x/ay,z/ay)
     return (4,x/az,y/az) if z>=0 else (5,-x/az,y/az)
@@ -74,7 +79,7 @@ class MixedLodSelector:
 
     def _leaf_at(self,leaves:set[PatchKey],direction:Vec3d)->PatchKey|None:
         face,u,v=direction_to_cube_face_uv(direction)
-        for level in range(self.max_level,-1,-1):
+        for level in range(self.max_level+1):
             side=1<<level;x=min(max(int((u*.5+.5)*side),0),side-1);y=min(max(int((v*.5+.5)*side),0),side-1);key=PatchKey(face,level,x,y)
             if key in leaves:return key
         return None
@@ -82,7 +87,7 @@ class MixedLodSelector:
     def _neighbor(self,leaves:set[PatchKey],key:PatchKey,edge:int)->PatchKey|None:
         u0,u1,v0,v1=patch_uv_bounds(key); eps=2e-8
         uv=(((u0+u1)*.5,v0-eps),(u1+eps,(v0+v1)*.5),((u0+u1)*.5,v1+eps),(u0-eps,(v0+v1)*.5))[edge]
-        return self._leaf_at(leaves,cube_face_direction(key.face,*uv))
+        return self._leaf_at(leaves,cube_face_vector(key.face,*uv))
 
     def _balance_neighbors(self,leaves:set[PatchKey],camera:PlanetCamera,viewport_height:int)->None:
         changed=True
@@ -104,33 +109,18 @@ class MixedLodSelector:
     def stitch_mask(
         self, key: PatchKey, render_keys: set[PatchKey],
     ) -> int:
-        mask = 0
-        for edge in range(4):
-            neighbor = self._neighbor(
-                render_keys,
-                key,
-                edge,
-            )
-            if (
-                neighbor is not None
-                and neighbor.level == key.level - 1
-            ):
-                mask |= 1 << edge
-
-        return mask
+        return self.boundary_masks(key,render_keys)[1]
 
 
     def skirt_mask(
         self, key: PatchKey, render_keys: set[PatchKey],
     ) -> int:
-        mask = 0
+        return self.boundary_masks(key,render_keys)[0]
+
+    def boundary_masks(self,key:PatchKey,render_keys:set[PatchKey])->tuple[int,int]:
+        skirt=0;stitch=0
         for edge in range(4):
-            neighbor = self._neighbor(
-                render_keys,
-                key,
-                edge,
-            )
-            # 没有邻居时用 skirt 兜底。
-            if neighbor is None:
-                mask |= 1 << edge
-        return mask
+            neighbor=self._neighbor(render_keys,key,edge)
+            if neighbor is None:skirt|=1<<edge
+            elif neighbor.level==key.level-1:stitch|=1<<edge
+        return skirt,stitch

@@ -203,3 +203,30 @@
 ### 剩余限制
 
 当前焊接操作表在 CPU 根据 Render Set 构建并上传，规模受固定 Patch 容量限制。后续若 Patch 数显著增加，应缓存未变化的邻接操作表或在 Tile Manager 的驻留事件中增量维护；Geomorph 仍未实现。
+
+## BUG-0007：M2 移动场景帧率低于实时目标
+
+- 状态：`open`
+- 所属阶段：M2 Mixed LOD、程序地形与自定义光栅
+- 发现条件：交互 Preview 持续移动，约 74 个可见 Patch，桌面窗口高分辨率输出。
+- 现象：移动过程中帧率低于 10 FPS，尚未确定 CPU LOD/邻接、GPU Patch 生成或逐像素光栅各自占比。
+
+### 根因
+
+RTX 3050 Laptop GPU、1280×720 的用户基线显示：平均帧时间 185.7 ms，其中 `terrain_dispatch_ms` 为 176.0 ms，而 Taichi 全部 GPU kernel 合计仅约 1.8 ms/帧。Python profile 进一步定位到 `_balance_render_coverage -> _neighbor -> _leaf_at` 的重复扫描、每帧对全部祖先重算 Priority，以及 Coverage 不变时仍重复计算边界 Mask 和可见集。原 `selection_ms` 还会在未选择的帧沿用旧值，造成统计误读。GPU 软件光栅不是当前低于 10 FPS 的主因。
+
+### 修复或缓解
+
+已增加 `tools/profile_m2.py`，分别测量 stable/move 的 CPU dispatch、同步完成的 Patch GPU 工作、Render GPU 工作、P50/P95/P99、Patch/三角形数量、Tile 候选分布、Python call site 和 Taichi kernel 明细。已实施：跳过已请求/驻留 Patch 的 Priority 重算、每帧复用相机裁剪上下文、Desired 祖先缓存、批量 Coverage 平衡、整数 Cube Grid 边界键、Coverage 边界 Mask 缓存、静止相机可见集缓存，以及 Render Set 未变化时跳过 GPU 状态重传。短基准在仍处于 LOD 收敛的情况下由 185.7 ms 降至约 39.2 ms；仍需用户使用完整 stable/move 命令复测。
+
+### 验证
+
+使用相同 CUDA 设备、配置、分辨率、seed、相机路径和预热帧数保存前后 JSON。首次 JIT 单独排除；`tile_overflow` 必须为零。最终以 Preview 稳定 FPS 和移动 P95/P99 卡顿共同验收。
+
+### 防回归措施
+
+每个重要 M2 性能改动都运行 stable/move 基准，并记录分辨率、后端、LOD 范围、Render Patch 数与 kernel 排名。同步诊断数据不直接等同于正常异步 Preview FPS。
+
+### 剩余限制
+
+当前只有极小 CPU 烟雾结果，不能据此推断目标 CUDA 后端瓶颈或宣称性能改善；需要在用户实际 GPU 上采集基线。

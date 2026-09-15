@@ -76,7 +76,7 @@ class PlanetRenderer:
         self.rv=ti.Vector.field(3,ti.f32,shape=rs);self.rn=ti.Vector.field(3,ti.f32,shape=rs);self.rm=ti.Vector.field(4,ti.f32,shape=rs);self.rh=ti.field(ti.f32,shape=rs);self.rc=ti.field(ti.i32,shape=rs);self.screen=ti.Vector.field(3,ti.f32,shape=rs);self.source=ti.field(ti.i32,shape=raster_capacity);self.valid=ti.field(ti.i32,shape=raster_capacity)
         self.tile_counts=ti.field(ti.i32,shape=(self.tiles_x,self.tiles_y));self.tile_triangles=ti.field(ti.i32,shape=(self.tiles_x,self.tiles_y,MAX_TRIANGLES_PER_TILE));self.tile_overflow=ti.field(ti.i32,shape=())
         shape=(width,height);self.depth=ti.field(ti.f32,shape=shape);self.gbuffer_position=ti.Vector.field(3,ti.f32,shape=shape);self.gbuffer_normal=ti.Vector.field(3,ti.f32,shape=shape);self.gbuffer_albedo=ti.Vector.field(3,ti.f32,shape=shape);self.gbuffer_material_weights=ti.Vector.field(4,ti.f32,shape=shape);self.gbuffer_height_m=ti.field(ti.f32,shape=shape);self.gbuffer_surface_id=ti.field(ti.i32,shape=shape);self.gbuffer_surface_cell_id=ti.field(ti.i32,shape=shape);self.hdr=ti.Vector.field(3,ti.f32,shape=shape);self.display=ti.Vector.field(3,ti.f32,shape=shape)
-        self._render_descriptors:tuple[PatchDescriptor,...]=();self._render_slots:dict[PatchKey,int]={};self._edge_signature:tuple|None=None
+        self._render_descriptors:tuple[PatchDescriptor,...]=();self._render_slots:dict[PatchKey,int]={};self._edge_signature:tuple|None=None;self._render_signature:tuple|None=None
 
     def _surface_edge_indices(self, edge:int)->tuple[int,...]:
         n=self.resolution;s=self.side
@@ -85,18 +85,18 @@ class PlanetRenderer:
         if edge==2:return tuple(n*s+x for x in range(s))
         return tuple(y*s for y in range(s))
 
-    def _vertex_direction_key(self,key:PatchKey,index:int)->tuple[float,float,float]:
+    def _vertex_direction_key(self,key:PatchKey,index:int)->tuple[int,int,int]:
         x=index%self.side;y=index//self.side
         total=(1<<key.level)*self.resolution
-        u=-1.0+2.0*(key.x*self.resolution+x)/total
-        v=-1.0+2.0*(key.y*self.resolution+y)/total
-        direction=cube_face_direction(key.face,u,v)
-        # Twelve decimal digits are much tighter than float32 angular
-        # precision, but merge algebraically identical cross-face vertices.
-        return tuple(round(float(component),12) for component in direction)
+        u=-total+2*(key.x*self.resolution+x);v=-total+2*(key.y*self.resolution+y)
+        mappings=((total,v,-u),(-total,v,u),(u,total,-v),(u,-total,v),(u,v,total),(-u,v,-total))
+        raw=mappings[key.face];divisor=math.gcd(math.gcd(abs(raw[0]),abs(raw[1])),abs(raw[2]))
+        # Normalizing the integer cube vector by its gcd gives an exact,
+        # allocation-free identity shared by levels and cube faces.
+        return raw[0]//divisor,raw[1]//divisor,raw[2]//divisor
 
     def _build_edge_operations(self,descriptors:list[PatchDescriptor],slots:dict[PatchKey,int|None])->tuple[np.ndarray,np.ndarray,np.ndarray]:
-        groups:dict[tuple[float,float,float],set[tuple[int,int]]]={}
+        groups:dict[tuple[int,int,int],set[tuple[int,int]]]={}
         stitch:list[tuple[int,int,int,int]]=[]
         for descriptor in descriptors:
             slot=slots.get(descriptor.key)
@@ -222,6 +222,9 @@ class PlanetRenderer:
     def set_render_patches(self,descriptors:list[PatchDescriptor],slots:dict[PatchKey,int|None])->None:
         self._render_descriptors=tuple(descriptors)
         self._render_slots={k:int(v) for k,v in slots.items() if v is not None}
+        render_signature=tuple(sorted((descriptor.key,int(slots[descriptor.key]),descriptor.skirt_mask,descriptor.stitch_mask) for descriptor in descriptors if slots.get(descriptor.key) is not None))
+        if render_signature==self._render_signature:
+            self.patch_count=len(render_signature);return
         active=np.zeros(self.max_patches,np.int32)
         skirt_masks = np.zeros(
             self.max_patches,
@@ -247,6 +250,7 @@ class PlanetRenderer:
             weld_dst,weld_src,stitch=self._build_edge_operations(descriptors,slots)
             self._set_edge_operations(weld_dst,weld_src,stitch)
             self._edge_signature=edge_signature
+        self._render_signature=render_signature
         self.patch_count=int(active.sum())
     @ti.kernel
     def _set_render(self,
