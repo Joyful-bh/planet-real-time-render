@@ -162,6 +162,14 @@ def execute_frame(
         "resident_patches": float(stats.resident_patches),
         "render_patches": float(stats.render_patches),
         "triangles": float(renderer.triangle_count),
+        "active_slots": float(renderer.active_slot_count[None]),
+        "clipped_triangles": float(
+            min(renderer.clipped_count[None], renderer.raster_capacity)
+        ),
+        "max_tile_candidates": float(renderer.max_tile_candidates[None]),
+        "tile_pairs": float(
+            min(renderer.tile_pair_count[None], renderer.tile_pair_capacity)
+        ),
         "tile_overflow": float(renderer.tile_overflow[None]),
     }
 
@@ -236,6 +244,10 @@ def run_scenario(name: str, args: argparse.Namespace, scene) -> dict[str, object
         "resident_patches",
         "render_patches",
         "triangles",
+        "active_slots",
+        "clipped_triangles",
+        "max_tile_candidates",
+        "tile_pairs",
         "tile_overflow",
     ):
         result[key] = {

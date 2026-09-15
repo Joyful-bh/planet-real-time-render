@@ -101,3 +101,70 @@ returned slot operations to the renderer. `terrain_gpu_ms` still measures the
 synchronized completion of patch generation and upload kernels. Keeping these
 values separate prevents GPU resource work from being misattributed to the
 LOD selector.
+
+## 2026-09 current raster baseline
+
+A short synchronized CUDA run on an RTX 3050 Laptop GPU at 1280×720 produced
+38 render patches and about 51k triangles in the measured stable frames. The
+historical Taichi kernel profile ranked the pixel `_raster` pass first
+(about 0.95 ms/frame), followed by
+`_clip` (about 0.71 ms), `_bin` (about 0.23 ms) and `_shade` (about 0.22 ms).
+Patch generation and normal generation were below 0.1 ms/frame in this sample.
+The diagnostic script synchronizes between stages, so its total frame time is
+not a preview-FPS prediction; the ranking is useful for choosing optimization
+work.
+
+The pre-fix geometry path dispatched `_transform` over the full slot capacity,
+`_clip` over `max_patches × local_triangle_count`, and `_bin` over the full
+clipped-buffer capacity. `_bin` also performed back-face rejection only after
+frustum clipping. These fixed-capacity passes were the main scaling risk as
+Mixed-LOD produced more triangles; the compact dispatch section below records
+their replacement.
+
+## 2026-09 compact raster dispatch
+
+The fixed-capacity dispatches above were replaced by a dense active-slot list
+and a dense clipped-triangle list. `_transform` and `_clip` now use the active
+counts, back-face rejection happens before Sutherland-Hodgman clipping, and
+`_bin` iterates only the emitted triangle count instead of the entire
+`raster_capacity` field. The latter is important with the current
+`512 × 1344 × 6 = 4,128,768` worst-case slots, while stable frames commonly
+contain fewer than 80 render patches.
+
+Rasterization uses a fast pixel-driven path for low-overdraw tiles. Every 60
+frames the renderer samples the GPU tile-overdraw maximum; when it reaches the
+fixed high-overdraw threshold of 256 candidates per tile it switches to a
+triangle-fragment depth
+pass with an atomic sortable depth key and a single per-pixel G-buffer resolve.
+This keeps the low-overdraw path fast while avoiding an unbounded
+pixel-times-candidate loop as terrain density increases. The triangle path is
+also bounded by `MAX_TRIANGLES_PER_TILE` and reports tile overflow as before.
+`tools/profile_m2.py` now reports active slots, compact clipped-triangle count,
+emitted tile-pair count and maximum tile candidates so the capacity reduction
+can be checked directly.
+The high-overdraw path consumes a dense tile/triangle-pair stream, so it does
+not scan the unused tail of every tile's fixed lookup capacity.
+
+### Threshold validation (2026-09-15)
+
+The same synchronized CUDA command was run on an RTX 3050 Laptop GPU at
+1280×720 for 60 warm-up and 180 measured frames. With the atomic depth path
+threshold at 64, the measured means were 19.55 ms (stable) and 27.20 ms
+(moving). The sampled tile maxima were only 101 and 106, so the expensive
+atomic path was selected for ordinary terrain. After raising the threshold to
+256, both scenarios stayed on `_raster_pixel` and measured 11.98 ms and
+16.19 ms respectively (38.7% and 40.5% lower). The current path has no tile
+overflow. This threshold is a workload guard, not a final replacement for a
+hardware rasterizer; it should be revalidated when patch resolution or screen
+coverage changes.
+
+The follow-up batch-visibility run (same backend, resolution and frame counts)
+reduced `terrain_dispatch_ms` to 1.83 ms stable and 4.12 ms moving. End-to-end
+means were 11.30 ms and 14.48 ms, with zero tile overflow. Run-to-run variance
+is expected on a desktop GPU, so these values are directional rather than a
+fixed FPS promise.
+The final dense tile-pair run measured 11.35 ms stable and 14.39 ms moving,
+with 47,577 tile pairs in the stable frame and 19,251–48,901 while moving.
+The moving P99 was still 63.72 ms, including a 45.86 ms P99
+`terrain_upload_dispatch_ms`; this remaining long tail is outside the GPU
+raster kernels and needs explicit upload/fence timeline profiling next.

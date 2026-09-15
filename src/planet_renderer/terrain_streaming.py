@@ -66,6 +66,12 @@ class TerrainTileManager:
         self.stats = TerrainDebugStats()
 
         self._bounds_cache: dict[PatchKey, tuple[np.ndarray, float, float]] = {}
+        self._anchor_cache: dict[PatchKey, np.ndarray] = {}
+        self._visibility_bounds_signature: frozenset[PatchKey] | None = None
+        self._visibility_bounds_keys: tuple[PatchKey, ...] = ()
+        self._visibility_centers = np.empty((0, 3), np.float64)
+        self._visibility_angular = np.empty(0, np.float64)
+        self._visibility_radii = np.empty(0, np.float64)
         self._balanced_input: frozenset[PatchKey] | None = None
         self._balanced_output: frozenset[PatchKey] = frozenset()
         self._needed_desired: frozenset[PatchKey] | None = None
@@ -130,9 +136,13 @@ class TerrainTileManager:
         skirt_mask: int = 0,
         stitch_mask: int = 0,
     ) -> TerrainPatchRenderDescriptor:
+        anchor = self._anchor_cache.get(key)
+        if anchor is None:
+            anchor = self.selector.center(key) * self.planet.radius_m
+            self._anchor_cache[key] = anchor
         return TerrainPatchRenderDescriptor(
             key=key,
-            anchor_global=patch_center_direction(key) * self.planet.radius_m,
+            anchor_global=anchor,
             sse=self.selector.sse(key, camera, viewport_height),
             priority=priority,
             skirt_mask=skirt_mask,
@@ -409,9 +419,7 @@ class TerrainTileManager:
                 viewport_height,
                 camera_frame,
             )
-            self._visible_cache = {
-                key for key in coverage if self._visible(key, visibility_context)
-            }
+            self._visible_cache = self._visible_batch(coverage, visibility_context)
             self._visibility_signature = visibility_signature
 
         visible = set(self._visible_cache)
@@ -582,6 +590,81 @@ class TerrainTileManager:
         if -y - z * tan_y > radius * vertical_scale:
             return False
         return True
+
+    def _visible_batch(self, keys: set[PatchKey], context) -> set[PatchKey]:
+        """Cull a coverage set with vectorized NumPy dot products.
+
+        Visibility is a CPU-side decision, but it runs for every camera update.
+        The scalar implementation performed several ``acos``/``norm`` calls
+        per patch and became visible in profiles before any GPU work started.
+        Bounds are immutable for a patch, so only the camera-dependent matrix
+        operations remain on subsequent frames.
+        """
+
+        if not keys:
+            return set()
+        signature = frozenset(keys)
+        if signature != self._visibility_bounds_signature:
+            ordered = tuple(sorted(keys))
+            bounds = [self._patch_bounds(key) for key in ordered]
+            self._visibility_bounds_signature = signature
+            self._visibility_bounds_keys = ordered
+            self._visibility_centers = np.asarray(
+                [value[0] for value in bounds], np.float64
+            )
+            self._visibility_angular = np.asarray(
+                [value[1] for value in bounds], np.float64
+            )
+            self._visibility_radii = np.asarray(
+                [value[2] for value in bounds], np.float64
+            )
+
+        (
+            camera_position,
+            camera_radius,
+            camera_dir,
+            right,
+            view_up,
+            forward,
+            tan_x,
+            tan_y,
+            horizontal_scale,
+            vertical_scale,
+        ) = context
+        centers = self._visibility_centers
+        radii = self._visibility_radii
+        visible = np.ones(len(self._visibility_bounds_keys), dtype=bool)
+
+        if camera_radius > self.planet.radius_m + 1.0:
+            horizon_angle = math.acos(
+                np.clip(self.planet.radius_m / camera_radius, -1.0, 1.0)
+            )
+            relief_angle = math.acos(
+                self.planet.radius_m
+                / (self.planet.radius_m + self.max_terrain_relief_m)
+            )
+            center_dirs = centers / self.planet.radius_m
+            separation = np.arccos(
+                np.clip(center_dirs @ camera_dir, -1.0, 1.0)
+            )
+            visible &= separation <= (
+                horizon_angle + self._visibility_angular + relief_angle
+            )
+
+        delta = centers - camera_position
+        x = delta @ right
+        y = delta @ view_up
+        z = delta @ forward
+        visible &= z + radii > 0.0
+        visible &= x - z * tan_x <= radii * horizontal_scale
+        visible &= -x - z * tan_x <= radii * horizontal_scale
+        visible &= y - z * tan_y <= radii * vertical_scale
+        visible &= -y - z * tan_y <= radii * vertical_scale
+        return {
+            key
+            for key, is_visible in zip(self._visibility_bounds_keys, visible)
+            if is_visible
+        }
 
     def _balance_render_coverage(self, coverage: set[PatchKey]) -> None:
         """Keep neighboring render leaves at most one level apart."""

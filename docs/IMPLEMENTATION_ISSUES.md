@@ -327,3 +327,97 @@ Taichi terrain-generation kernels now live in a dedicated `TerrainRenderer`
 component. The remaining raster backend consumes its geometry fields and owns
 camera-relative transformation, clipping, rasterization, G-buffer writes, and
 compositing.
+
+## BUG-0011: Tangent camera motion converged toward a pole
+
+- Status: `fixed`
+- Phase: M0 planet camera movement
+- Symptom: holding `W` or `S` with a non-cardinal heading caused the camera
+  path to spiral toward one point on the planet instead of following the
+  intended circular tangent orbit. Linear tangent offsets also accumulated a
+  small radial error.
+- Root cause: preview input was interpreted as a constant local compass
+  heading. Recomputing the geographic tangent basis after every step produces
+  a rhumb-line path on a sphere; it is not the great circle defined by the
+  current camera tangent.
+
+### Fix
+
+`PlanetCamera.move_local()` now separates tangent and radial motion. The
+tangent component rotates the camera position around the great-circle normal
+using Rodrigues' formula, preserving altitude. The camera forward vector is
+rotated by the same transform and converted back to yaw/pitch, which
+parallel-transports the heading instead of resetting it to a constant compass
+bearing.
+
+### Verification
+
+The camera geometry tests include a diagonal tangent-motion case and verify
+constant radius plus a stable great-circle plane. The focused M0 test run
+passes (`6 passed`).
+
+### Remaining limitation
+
+Yaw/pitch coordinates remain singular exactly at geographic poles because the
+local East/North chart requires a fallback basis. The global position and
+great-circle motion remain continuous through that region.
+
+## BUG-0012: Raster kernels scaled with fixed and sparse capacities
+
+- Status: `fixed`
+- Phase: M2 raster dispatch/performance
+- Symptom: `_transform`, `_clip` and `_bin` processed the configured maximum
+  number of slots or clipped-triangle records even when only a small Render
+  Set was visible. Back-face rejection also happened after clipping, and the
+  pixel rasterizer re-tested every tile candidate for every pixel.
+- Root cause: GPU buffers used source-triangle offsets as output positions.
+  This left holes between clipped triangles and provided no active-count or
+  compact-index contract to later kernels.
+
+### Fix
+
+The renderer now uploads a dense active-slot list and dispatches transform and
+clip work from its runtime count. Back-face rejection happens before the
+five-plane clipper. Clipped triangles are appended to a dense list using an
+atomic counter, so `_bin` iterates only the emitted range. Rasterization uses a
+pixel-driven fast path for low tile overdraw; after periodic GPU overdraw
+sampling it switches to a triangle-fragment atomic depth pass and one
+per-pixel G-buffer resolve when tile candidate counts become high.
+The high-overdraw path now consumes a dense tile/triangle-pair stream emitted
+by `_bin`; it no longer launches over the full `tiles × 512` candidate
+capacity.
+
+### Verification
+
+The M2 CPU G-buffer smoke test passes, and CUDA smoke profiling at 1280×720
+shows the compact `_bin` and active transform/clip kernels with zero tile
+overflow. The fixed-capacity and sparse-output behavior is documented in
+`docs/M2_PERFORMANCE_PROFILING.md`.
+
+The synchronized 180-frame CUDA comparison on the same RTX 3050 Laptop GPU
+also exposed an overly eager adaptive-raster switch: the 64-candidate
+threshold selected the atomic depth path at only 101 candidates per tile,
+raising stable-frame time from 11.98 ms to 19.55 ms and move-frame time from
+16.19 ms to 27.20 ms. Raising the switch threshold to 256 keeps the cheaper
+pixel path for the current workload; the same run measured 11.98 ms stable
+and 16.19 ms while moving, with zero tile overflow.
+
+The follow-up batch-visibility run kept the same workload and reduced the
+terrain CPU dispatch to 1.83 ms (stable) and 4.12 ms (moving). Its end-to-end
+means were 11.30 ms and 14.48 ms respectively, still with zero tile overflow.
+The final dense tile-pair run measured 11.35 ms stable and 14.39 ms moving;
+the small difference is normal run-to-run variance.
+
+### Remaining limitation
+
+The tile lookup array still has a fixed overflow cap (`512` candidates per
+tile), so extreme overdraw is reported as overflow and requires a future
+prefix-sum or hierarchical binning pass for full scalability. Normal frames
+no longer scan that unused capacity on either raster path.
+
+The final moving profile still has a long tail (P99 frame 63.72 ms; P99
+`terrain_upload_dispatch_ms` 45.86 ms) despite a 14.39 ms mean. The GPU
+raster kernels take roughly 2.5 ms per frame in total in this workload, so these stalls
+are an upload/driver or CPU streaming scheduling problem rather than a
+triangle coverage problem; a future timeline/fence pass must isolate it
+before increasing terrain density.

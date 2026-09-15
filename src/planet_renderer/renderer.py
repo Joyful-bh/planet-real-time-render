@@ -25,6 +25,14 @@ TILE_SIZE = 16
 MAX_TRIANGLES_PER_TILE = 512
 MAX_CLIP_VERTICES = 8
 MAX_CLIPPED_TRIANGLES = 6
+DEPTH_KEY_Q_BITS = 32
+DEPTH_KEY_Q_MASK = (1 << DEPTH_KEY_Q_BITS) - 1
+DEPTH_KEY_SENTINEL = (1 << 64) - 1
+# The atomic depth path has a higher launch/atomic cost than the direct
+# candidate loop on the current tile sizes.  Keep it for genuinely dense
+# tiles only; ordinary terrain should stay on the low-overdraw path.
+TRIANGLE_RASTER_THRESHOLD = 256
+RASTER_PROBE_INTERVAL = 60
 
 
 @dataclass(frozen=True)
@@ -131,6 +139,12 @@ class PlanetRenderer:
             ti.i32,
             shape=max_patches,
         )
+        # Render Set slots are kept in a dense device-side list.  The slot
+        # allocator is intentionally sparse because it is shared with the
+        # terrain cache, so kernels must never use the slot number as a loop
+        # bound.
+        self.active_slot_ids = ti.field(ti.i32, shape=max_patches)
+        self.active_slot_count = ti.field(ti.i32, shape=())
         # Render-patch boundaries are welded after camera transformation.  A
         # shared theoretical cube-sphere vertex otherwise differs slightly
         # when reconstructed through two independent float32 patch anchors.
@@ -150,6 +164,7 @@ class PlanetRenderer:
         raster_capacity = (
             max_patches * self.local_triangle_count * MAX_CLIPPED_TRIANGLES
         )
+        self.raster_capacity = raster_capacity
         rs = (raster_capacity, 3)
         self.rv = ti.Vector.field(3, ti.f32, shape=rs)
         self.rn = ti.Vector.field(3, ti.f32, shape=rs)
@@ -159,11 +174,29 @@ class PlanetRenderer:
         self.screen = ti.Vector.field(3, ti.f32, shape=rs)
         self.source = ti.field(ti.i32, shape=raster_capacity)
         self.valid = ti.field(ti.i32, shape=raster_capacity)
+        # Clipped triangles are appended densely.  ``valid`` remains as a
+        # diagnostic field, while the render path uses this count directly.
+        self.clipped_count = ti.field(ti.i32, shape=())
         self.tile_counts = ti.field(ti.i32, shape=(self.tiles_x, self.tiles_y))
         self.tile_triangles = ti.field(
             ti.i32, shape=(self.tiles_x, self.tiles_y, MAX_TRIANGLES_PER_TILE)
         )
+        # High-overdraw rasterization consumes a dense stream of tile/triangle
+        # pairs.  Keeping this separate from the tile-major lookup table lets
+        # it dispatch only emitted pairs instead of scanning each tile's full
+        # 512-entry capacity.
+        self.tile_pair_capacity = (
+            self.tiles_x * self.tiles_y * MAX_TRIANGLES_PER_TILE
+        )
+        self.tile_pair_count = ti.field(ti.i32, shape=())
+        self.tile_pairs = ti.field(ti.u64, shape=self.tile_pair_capacity)
         self.tile_overflow = ti.field(ti.i32, shape=())
+        self.max_tile_candidates = ti.field(ti.i32, shape=())
+        # The depth pass stores a sortable (positive-float-depth, triangle-id)
+        # key.  This lets all triangle fragments update the depth buffer with
+        # one atomic operation, while the resolve pass interpolates the
+        # winning triangle exactly once per pixel.
+        self.depth_key = ti.field(ti.u64, shape=(width, height))
         shape = (width, height)
         self.depth = ti.field(ti.f32, shape=shape)
         self.gbuffer_position = ti.Vector.field(3, ti.f32, shape=shape)
@@ -179,6 +212,8 @@ class PlanetRenderer:
         self._render_slots: dict[PatchKey, int] = {}
         self._edge_signature: tuple | None = None
         self._render_signature: tuple | None = None
+        self._raster_probe_frame = 0
+        self._use_triangle_raster = False
 
     def _surface_edge_indices(self, edge: int) -> tuple[int, ...]:
         n = self.resolution
@@ -332,11 +367,6 @@ class PlanetRenderer:
                 active[slot] = 1
                 skirt_masks[slot] = descriptor.skirt_mask
                 stitch_masks[slot] = descriptor.stitch_mask
-        self._set_render(
-            active,
-            skirt_masks,
-            stitch_masks,
-        )
         edge_signature = tuple(
             sorted(
                 (descriptor.key, int(slots[descriptor.key]), descriptor.stitch_mask)
@@ -350,37 +380,58 @@ class PlanetRenderer:
             self._edge_signature = edge_signature
         self._render_signature = render_signature
         self.patch_count = int(active.sum())
+        active_ids = np.zeros(self.max_patches, np.int32)
+        active_count = 0
+        for slot in np.flatnonzero(active):
+            active_ids[active_count] = int(slot)
+            active_count += 1
+        self._set_render(
+            active,
+            skirt_masks,
+            stitch_masks,
+            active_ids,
+            active_count,
+        )
 
     @ti.kernel
     def _set_render(
         self,
         active: ti.types.ndarray(dtype=ti.i32, ndim=1),
-        skirt_masks: ti.types.ndarray(
-            dtype=ti.i32,
-            ndim=1,
-        ),
-        stitch_masks: ti.types.ndarray(
-            dtype=ti.i32,
-            ndim=1,
-        ),
+        skirt_masks: ti.types.ndarray(dtype=ti.i32, ndim=1),
+        stitch_masks: ti.types.ndarray(dtype=ti.i32, ndim=1),
+        active_ids: ti.types.ndarray(dtype=ti.i32, ndim=1),
+        active_count: ti.i32,
     ):
         for i in range(self.max_patches):
             self.slot_render[i] = active[i]
             self.slot_skirt_mask[i] = skirt_masks[i]
             self.slot_stitch_mask[i] = stitch_masks[i]
+        self.active_slot_count[None] = active_count
+        for i in range(active_count):
+            self.active_slot_ids[i] = active_ids[i]
 
     @ti.kernel
     def _set_anchors(self, a: ti.types.ndarray(dtype=ti.f32, ndim=2)):
-        for i in range(self.max_patches):
-            self.anchor_relative[i] = ti.Vector([a[i, 0], a[i, 1], a[i, 2]])
+        for i in range(self.active_slot_count[None]):
+            slot = self.active_slot_ids[i]
+            self.anchor_relative[slot] = ti.Vector(
+                [a[slot, 0], a[slot, 1], a[slot, 2]]
+            )
 
     @ti.kernel
     def _clear(self):
+        previous_count = ti.min(self.clipped_count[None], self.raster_capacity)
+        for i in range(previous_count):
+            self.valid[i] = 0
+        self.clipped_count[None] = 0
+        self.tile_pair_count[None] = 0
         self.tile_overflow[None] = 0
+        self.max_tile_candidates[None] = 0
         for q in ti.grouped(self.tile_counts):
             self.tile_counts[q] = 0
         for q in ti.grouped(self.depth):
             self.depth[q] = 1e30
+            self.depth_key[q] = ti.u64(DEPTH_KEY_SENTINEL)
             self.gbuffer_surface_id[q] = -1
             self.gbuffer_surface_cell_id[q] = -1
 
@@ -394,16 +445,16 @@ class PlanetRenderer:
         vu: ti.types.vector(3, ti.f32),
         f: ti.types.vector(3, ti.f32),
     ):
-        for slot, index in self.view:
-            if self.slot_render[slot]:
-                g = (
-                    self.anchor_relative[slot]
-                    + self.terrain_renderer.offset[slot, index]
-                )
-                local = ti.Vector([g.dot(e), g.dot(u), g.dot(n)])
-                self.view[slot, index] = ti.Vector(
-                    [local.dot(r), local.dot(vu), local.dot(f)]
-                )
+        vertex_count = self.active_slot_count[None] * self.vertices_per_patch
+        for active_vertex in range(vertex_count):
+            active_index = active_vertex // self.vertices_per_patch
+            index = active_vertex % self.vertices_per_patch
+            slot = self.active_slot_ids[active_index]
+            g = self.anchor_relative[slot] + self.terrain_renderer.offset[slot, index]
+            local = ti.Vector([g.dot(e), g.dot(u), g.dot(n)])
+            self.view[slot, index] = ti.Vector(
+                [local.dot(r), local.dot(vu), local.dot(f)]
+            )
 
     @ti.kernel
     def _weld_edges(self):
@@ -449,7 +500,6 @@ class PlanetRenderer:
     @ti.func
     def _emit(
         self,
-        s: ti.i32,
         src: ti.i32,
         v: ti.template(),
         n: ti.template(),
@@ -458,24 +508,29 @@ class PlanetRenderer:
         c: ti.template(),
         tf: ti.f32,
     ):
-        aspect = ti.cast(self.width, ti.f32) / self.height
-        for k in ti.static(range(3)):
-            p = v[k, :]
-            self.rv[s, k] = p
-            self.rn[s, k] = n[k, :]
-            self.rm[s, k] = m[k, :]
-            self.rh[s, k] = h[k]
-            self.rc[s, k] = c[k]
-            projected = ti.Vector(
-                [
-                    (p.x / (p.z * tf * aspect) * 0.5 + 0.5) * self.width,
-                    (p.y / (p.z * tf) * 0.5 + 0.5) * self.height,
-                ]
-            )
-            projected = ti.floor(projected * 256.0 + 0.5) / 256.0
-            self.screen[s, k] = ti.Vector([projected.x, projected.y, p.z])
-        self.source[s] = src
-        self.valid[s] = 1
+        # Every source triangle can produce zero to six clipped triangles.
+        # Atomically append each emitted triangle so the following bin pass
+        # sees a dense list rather than scanning the fixed-capacity holes.
+        s = ti.atomic_add(self.clipped_count[None], 1)
+        if s < self.raster_capacity:
+            aspect = ti.cast(self.width, ti.f32) / self.height
+            for k in ti.static(range(3)):
+                p = v[k, :]
+                self.rv[s, k] = p
+                self.rn[s, k] = n[k, :]
+                self.rm[s, k] = m[k, :]
+                self.rh[s, k] = h[k]
+                self.rc[s, k] = c[k]
+                projected = ti.Vector(
+                    [
+                        (p.x / (p.z * tf * aspect) * 0.5 + 0.5) * self.width,
+                        (p.y / (p.z * tf) * 0.5 + 0.5) * self.height,
+                    ]
+                )
+                projected = ti.floor(projected * 256.0 + 0.5) / 256.0
+                self.screen[s, k] = ti.Vector([projected.x, projected.y, p.z])
+            self.source[s] = src
+            self.valid[s] = 1
 
     @ti.func
     def _clip_distance(
@@ -502,12 +557,12 @@ class PlanetRenderer:
         aspect = ti.cast(self.width, ti.f32) / self.height
         tan_x = tf * aspect
         tan_y = tf
-        for source_id in range(self.max_patches * self.local_triangle_count):
-            slot = source_id // self.local_triangle_count
-            local_id = source_id % self.local_triangle_count
-            s = source_id * MAX_CLIPPED_TRIANGLES
-            for output in range(MAX_CLIPPED_TRIANGLES):
-                self.valid[s + output] = 0
+        source_count = self.active_slot_count[None] * self.local_triangle_count
+        for active_source in range(source_count):
+            active_index = active_source // self.local_triangle_count
+            slot = self.active_slot_ids[active_index]
+            local_id = active_source % self.local_triangle_count
+            source_id = slot * self.local_triangle_count + local_id
             skirt_edge = (local_id - self.surface_triangle_count) // (
                 self.resolution * 2
             )
@@ -529,6 +584,12 @@ class PlanetRenderer:
                     materials[vertex, :] = self.terrain_renderer.material[slot, index]
                     heights[vertex] = self.terrain_renderer.height_m[slot, index]
                     cells[vertex] = self.terrain_renderer.cell[slot, index]
+                front_facing = (positions[1, :] - positions[0, :]).cross(
+                    positions[2, :] - positions[0, :]
+                ).dot(-positions[0, :]) < 0.0
+                is_skirt = local_id >= self.surface_triangle_count
+                if not is_skirt and not front_facing:
+                    continue
                 count = 3
                 read_buffer = 0
                 for plane in range(5):
@@ -611,7 +672,6 @@ class PlanetRenderer:
                         b = a + triangle + 1
                         c = a + triangle + 2
                         self._emit(
-                            s + triangle,
                             source_id,
                             ti.Matrix.rows(
                                 [positions[a, :], positions[b, :], positions[c, :]]
@@ -629,33 +689,37 @@ class PlanetRenderer:
 
     @ti.kernel
     def _bin(self):
-        for q in self.valid:
-            if self.valid[q]:
-                source_id = self.source[q]
-                local_id = source_id % self.local_triangle_count
-                is_skirt = local_id >= self.surface_triangle_count
-                front_facing = (self.rv[q, 1] - self.rv[q, 0]).cross(
-                    self.rv[q, 2] - self.rv[q, 0]
-                ).dot(-self.rv[q, 0]) < 0.0
-                if is_skirt or front_facing:
-                    a, b, c = self.screen[q, 0], self.screen[q, 1], self.screen[q, 2]
-                    x0 = ti.max(ti.cast(ti.floor(ti.min(a.x, b.x, c.x)), ti.i32), 0)
-                    x1 = ti.min(
-                        ti.cast(ti.ceil(ti.max(a.x, b.x, c.x)), ti.i32), self.width - 1
+        triangle_count = ti.min(self.clipped_count[None], self.raster_capacity)
+        for q in range(triangle_count):
+            a, b, c = self.screen[q, 0], self.screen[q, 1], self.screen[q, 2]
+            x0 = ti.max(ti.cast(ti.floor(ti.min(a.x, b.x, c.x)), ti.i32), 0)
+            x1 = ti.min(
+                ti.cast(ti.ceil(ti.max(a.x, b.x, c.x)), ti.i32), self.width - 1
+            )
+            y0 = ti.max(ti.cast(ti.floor(ti.min(a.y, b.y, c.y)), ti.i32), 0)
+            y1 = ti.min(
+                ti.cast(ti.ceil(ti.max(a.y, b.y, c.y)), ti.i32), self.height - 1
+            )
+            if x0 <= x1 and y0 <= y1:
+                for x, y in ti.ndrange(
+                    (x0 // TILE_SIZE, x1 // TILE_SIZE + 1),
+                    (y0 // TILE_SIZE, y1 // TILE_SIZE + 1),
+                ):
+                    k = ti.atomic_add(self.tile_counts[x, y], 1)
+                    ti.atomic_max(
+                        self.max_tile_candidates[None],
+                        ti.min(k + 1, MAX_TRIANGLES_PER_TILE),
                     )
-                    y0 = ti.max(ti.cast(ti.floor(ti.min(a.y, b.y, c.y)), ti.i32), 0)
-                    y1 = ti.min(
-                        ti.cast(ti.ceil(ti.max(a.y, b.y, c.y)), ti.i32), self.height - 1
-                    )
-                    if x0 <= x1 and y0 <= y1:
-                        for x, y in ti.ndrange(
-                            (x0 // 16, x1 // 16 + 1), (y0 // 16, y1 // 16 + 1)
-                        ):
-                            k = ti.atomic_add(self.tile_counts[x, y], 1)
-                            if k < MAX_TRIANGLES_PER_TILE:
-                                self.tile_triangles[x, y, k] = q
-                            else:
-                                ti.atomic_add(self.tile_overflow[None], 1)
+                    if k < MAX_TRIANGLES_PER_TILE:
+                        self.tile_triangles[x, y, k] = q
+                        pair = ti.atomic_add(self.tile_pair_count[None], 1)
+                        if pair < self.tile_pair_capacity:
+                            tile_id = y * self.tiles_x + x
+                            self.tile_pairs[pair] = (
+                                ti.cast(tile_id, ti.u64) << 32
+                            ) | ti.cast(q, ti.u64)
+                    else:
+                        ti.atomic_add(self.tile_overflow[None], 1)
 
     @ti.func
     def _edge(self, a: ti.template(), b: ti.template(), p: ti.template()) -> ti.f32:
@@ -726,7 +790,14 @@ class PlanetRenderer:
         return color
 
     @ti.kernel
-    def _raster(self, mode: ti.i32):
+    def _raster_pixel(self, mode: ti.i32):
+        """Fast path for low-overdraw tiles.
+
+        Pixels remain the parallel unit of work, while the compact tile list
+        bounds the candidate loop.  The adaptive dispatcher only selects this
+        path when tile overdraw is low; high-overdraw frames use the atomic
+        depth path below so candidate traversal does not multiply by pixels.
+        """
         for x, y in self.depth:
             p = ti.Vector([ti.cast(x, ti.f32) + 0.5, ti.cast(y, ti.f32) + 0.5])
             best = 1e30
@@ -736,10 +807,12 @@ class PlanetRenderer:
             bn = ti.Vector.zero(ti.f32, 3)
             bm = ti.Vector.zero(ti.f32, 4)
             bh = 0.0
-            for k in range(
-                ti.min(self.tile_counts[x // 16, y // 16], MAX_TRIANGLES_PER_TILE)
-            ):
-                q = self.tile_triangles[x // 16, y // 16, k]
+            candidate_count = ti.min(
+                self.tile_counts[x // TILE_SIZE, y // TILE_SIZE],
+                MAX_TRIANGLES_PER_TILE,
+            )
+            for k in range(candidate_count):
+                q = self.tile_triangles[x // TILE_SIZE, y // TILE_SIZE, k]
                 a, b, c = self.screen[q, 0], self.screen[q, 1], self.screen[q, 2]
                 area = self._edge(a.xy, b.xy, c.xy)
                 sg = 1.0 if area > 0 else -1.0
@@ -791,14 +864,154 @@ class PlanetRenderer:
                             vi = 1
                         if w.z > w[vi]:
                             vi = 2
-                        cell = self.rc[q, vi]
                         best = z
                         src = self.source[q]
+                        cell = self.rc[q, vi]
             if src >= 0:
                 slot = src // self.local_triangle_count
                 self.depth[x, y] = best
                 self.gbuffer_surface_id[x, y] = src
                 self.gbuffer_surface_cell_id[x, y] = cell
+                self.gbuffer_position[x, y] = bp
+                self.gbuffer_normal[x, y] = bn
+                self.gbuffer_material_weights[x, y] = bm
+                self.gbuffer_height_m[x, y] = bh
+                self.gbuffer_albedo[x, y] = self._debug_color(bh, slot, mode)
+
+    @ti.kernel
+    def _raster_depth(self):
+        # Dispatch one independent work item per emitted tile/candidate pair.
+        # ``_bin`` compacts these pairs into ``tile_pairs`` so this pass does
+        # not scan the unused tail of every tile's fixed lookup capacity.
+        pair_count = ti.min(self.tile_pair_count[None], self.tile_pair_capacity)
+        for pair in range(pair_count):
+            packed = self.tile_pairs[pair]
+            tile_id = ti.cast(packed >> 32, ti.i32)
+            q = ti.cast(packed & ti.u64(0xFFFFFFFF), ti.i32)
+            tile_x = tile_id % self.tiles_x
+            tile_y = tile_id // self.tiles_x
+            a, b, c = self.screen[q, 0], self.screen[q, 1], self.screen[q, 2]
+            area = self._edge(a.xy, b.xy, c.xy)
+            if ti.abs(area) > 1e-8:
+                sg = 1.0 if area > 0 else -1.0
+                tile_x0 = tile_x * TILE_SIZE
+                tile_y0 = tile_y * TILE_SIZE
+                tile_x1 = ti.min(tile_x0 + TILE_SIZE, self.width) - 1
+                tile_y1 = ti.min(tile_y0 + TILE_SIZE, self.height) - 1
+                x0 = ti.max(
+                    ti.cast(ti.floor(ti.min(a.x, b.x, c.x)), ti.i32), tile_x0
+                )
+                x1 = ti.min(
+                    ti.cast(ti.ceil(ti.max(a.x, b.x, c.x)), ti.i32), tile_x1
+                )
+                y0 = ti.max(
+                    ti.cast(ti.floor(ti.min(a.y, b.y, c.y)), ti.i32), tile_y0
+                )
+                y1 = ti.min(
+                    ti.cast(ti.ceil(ti.max(a.y, b.y, c.y)), ti.i32), tile_y1
+                )
+                if x0 <= x1 and y0 <= y1:
+                    for x, y in ti.ndrange((x0, x1 + 1), (y0, y1 + 1)):
+                        p = ti.Vector(
+                            [ti.cast(x, ti.f32) + 0.5, ti.cast(y, ti.f32) + 0.5]
+                        )
+                        e = ti.Vector(
+                            [
+                                self._edge(b.xy, c.xy, p) * sg,
+                                self._edge(c.xy, a.xy, p) * sg,
+                                self._edge(a.xy, b.xy, p) * sg,
+                            ]
+                        )
+                        inside = (
+                            (
+                                e.x > 0.0
+                                or (
+                                    e.x == 0.0
+                                    and self._top_left(b.xy, c.xy, sg) != 0
+                                )
+                            )
+                            and (
+                                e.y > 0.0
+                                or (
+                                    e.y == 0.0
+                                    and self._top_left(c.xy, a.xy, sg) != 0
+                                )
+                            )
+                            and (
+                                e.z > 0.0
+                                or (
+                                    e.z == 0.0
+                                    and self._top_left(a.xy, b.xy, sg) != 0
+                                )
+                            )
+                        )
+                        if inside:
+                            l = e / ti.abs(area)
+                            z = 1.0 / ti.max(
+                                l.x / a.z + l.y / b.z + l.z / c.z,
+                                1e-20,
+                            )
+                            depth_bits = ti.bit_cast(z, ti.u32)
+                            key = (
+                                ti.cast(depth_bits, ti.u64) << DEPTH_KEY_Q_BITS
+                            ) | ti.cast(q, ti.u64)
+                            ti.atomic_min(self.depth_key[x, y], key)
+
+    @ti.kernel
+    def _resolve_raster(self, mode: ti.i32):
+        # Resolve the triangle selected by the atomic depth key.  This is one
+        # interpolation per covered pixel instead of a second candidate scan.
+        for x, y in self.depth:
+            key = self.depth_key[x, y]
+            if key != ti.u64(DEPTH_KEY_SENTINEL):
+                depth_bits = ti.cast(key >> DEPTH_KEY_Q_BITS, ti.u32)
+                q = ti.cast(key & ti.u64(DEPTH_KEY_Q_MASK), ti.i32)
+                z = ti.bit_cast(depth_bits, ti.f32)
+                a, b, c = self.screen[q, 0], self.screen[q, 1], self.screen[q, 2]
+                area = self._edge(a.xy, b.xy, c.xy)
+                sg = 1.0 if area > 0 else -1.0
+                p = ti.Vector([ti.cast(x, ti.f32) + 0.5, ti.cast(y, ti.f32) + 0.5])
+                e = ti.Vector(
+                    [
+                        self._edge(b.xy, c.xy, p) * sg,
+                        self._edge(c.xy, a.xy, p) * sg,
+                        self._edge(a.xy, b.xy, p) * sg,
+                    ]
+                )
+                l = e / ti.abs(area)
+                w = ti.Vector(
+                    [l.x * z / a.z, l.y * z / b.z, l.z * z / c.z]
+                )
+                bp = (
+                    self.rv[q, 0] * w.x
+                    + self.rv[q, 1] * w.y
+                    + self.rv[q, 2] * w.z
+                )
+                bn = (
+                    self.rn[q, 0] * w.x
+                    + self.rn[q, 1] * w.y
+                    + self.rn[q, 2] * w.z
+                ).normalized()
+                bm = (
+                    self.rm[q, 0] * w.x
+                    + self.rm[q, 1] * w.y
+                    + self.rm[q, 2] * w.z
+                )
+                bh = (
+                    self.rh[q, 0] * w.x
+                    + self.rh[q, 1] * w.y
+                    + self.rh[q, 2] * w.z
+                )
+                vi = 0
+                if w.y > w.x:
+                    vi = 1
+                if w.z > w[vi]:
+                    vi = 2
+                src = self.source[q]
+                slot = src // self.local_triangle_count
+                self.depth[x, y] = z
+                self.gbuffer_surface_id[x, y] = src
+                self.gbuffer_surface_cell_id[x, y] = self.rc[q, vi]
                 self.gbuffer_position[x, y] = bp
                 self.gbuffer_normal[x, y] = bn
                 self.gbuffer_material_weights[x, y] = bm
@@ -866,7 +1079,20 @@ class PlanetRenderer:
         self._stitch_lod_edges()
         self._clip(near, tf)
         self._bin()
-        self._raster(self.debug_view)
+        self._raster_probe_frame += 1
+        if self._raster_probe_frame % RASTER_PROBE_INTERVAL == 0:
+            # Reading one scalar every few frames avoids a per-frame
+            # synchronization point while still switching to the
+            # triangle-driven path as soon as tile overdraw becomes large.
+            ti.sync()
+            self._use_triangle_raster = (
+                int(self.max_tile_candidates[None]) >= TRIANGLE_RASTER_THRESHOLD
+            )
+        if self._use_triangle_raster:
+            self._raster_depth()
+            self._resolve_raster(self.debug_view)
+        else:
+            self._raster_pixel(self.debug_view)
         self._shade(
             tuple(sun_local),
             lighting.sun_disk_radiance,

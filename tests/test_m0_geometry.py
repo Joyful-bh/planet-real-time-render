@@ -47,6 +47,37 @@ class PlanetGeometryTests(unittest.TestCase):
         camera.move_local(self.planet, 0.0, -100.0, 0.0)
         self.assertGreaterEqual(self.planet.altitude_m(camera.position_global), 0.49)
 
+    def test_camera_tangent_motion_stays_on_one_great_circle(self) -> None:
+        position = self.planet.surface_position(np.array([0.0, 0.0, 1.0]), 1000.0)
+        camera = PlanetCamera(position, yaw_degrees=45.0, pitch_degrees=0.0)
+        initial_radius = np.linalg.norm(camera.position_global)
+        frame = self.planet.local_frame(camera.position_global)
+        _, _, forward_local = camera.view_basis_local()
+        tangent = frame.local_to_global_direction(
+            np.array([forward_local[0], 0.0, forward_local[2]])
+        )
+        orbit_normal = np.cross(
+            camera.position_global / initial_radius,
+            tangent / np.linalg.norm(tangent),
+        )
+
+        for _ in range(200):
+            yaw = math.radians(camera.yaw_degrees)
+            camera.move_local(
+                self.planet,
+                1000.0 * math.sin(yaw),
+                0.0,
+                1000.0 * math.cos(yaw),
+            )
+
+        final_radius = np.linalg.norm(camera.position_global)
+        self.assertAlmostEqual(final_radius, initial_radius, places=6)
+        self.assertAlmostEqual(
+            float(np.dot(orbit_normal, camera.position_global / final_radius)),
+            0.0,
+            places=10,
+        )
+
     def test_static_lighting_snapshot_identity(self) -> None:
         state = LightingState(
             np.array([1.0, 2.0, 3.0]), 0.266, (1.0, 1.0, 1.0), (50.0, 50.0, 50.0)
