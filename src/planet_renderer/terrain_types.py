@@ -1,7 +1,10 @@
 """地形子系统共享的轻量数据类型。"""
+
 from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import IntEnum
+
 import numpy as np
 
 
@@ -13,16 +16,22 @@ class PatchKey:
     y: int
 
     def children(self) -> tuple["PatchKey", ...]:
-        x, y, level = self.x*2, self.y*2, self.level+1
-        return tuple(PatchKey(self.face, level, x+dx, y+dy) for dy in range(2) for dx in range(2))
+        x, y, level = self.x * 2, self.y * 2, self.level + 1
+        return tuple(
+            PatchKey(self.face, level, x + dx, y + dy)
+            for dy in range(2)
+            for dx in range(2)
+        )
 
     def parent(self) -> "PatchKey | None":
-        return None if self.level == 0 else PatchKey(self.face, self.level-1, self.x//2, self.y//2)
+        if self.level == 0:
+            return None
+        return PatchKey(self.face, self.level - 1, self.x // 2, self.y // 2)
 
     def is_ancestor_of(self, other: "PatchKey") -> bool:
         if self.face != other.face or self.level > other.level:
             return False
-        shift = other.level-self.level
+        shift = other.level - self.level
         return other.x >> shift == self.x and other.y >> shift == self.y
 
 
@@ -34,13 +43,57 @@ class PatchState(IntEnum):
 
 
 @dataclass(frozen=True)
-class PatchDescriptor:
+class TerrainPatchRenderDescriptor:
+    """Immutable description of one patch needed by a renderer.
+
+    The descriptor deliberately contains no GPU handle. Slot assignment is a
+    streaming/resource-management concern and is carried separately by
+    :class:`TerrainFrame` so terrain selection can run without importing or
+    calling a renderer.
+    """
+
     key: PatchKey
     anchor_global: np.ndarray
     sse: float
     priority: float
     skirt_mask: int = 0
     stitch_mask: int = 0
+
+    @property
+    def face(self) -> int:
+        return self.key.face
+
+    @property
+    def level(self) -> int:
+        return self.key.level
+
+    @property
+    def x(self) -> int:
+        return self.key.x
+
+    @property
+    def y(self) -> int:
+        return self.key.y
+
+
+# Compatibility name retained for M2 callers while the boundary migrates to
+# the more explicit descriptor name.
+PatchDescriptor = TerrainPatchRenderDescriptor
+
+
+@dataclass(frozen=True)
+class PatchUploadRequest:
+    """A patch that should be uploaded into one renderer slot."""
+
+    slot: int
+    descriptor: TerrainPatchRenderDescriptor
+
+
+@dataclass(frozen=True)
+class PatchReleaseRequest:
+    """A renderer slot that can be released before new uploads."""
+
+    slot: int
 
 
 @dataclass(frozen=True)
@@ -60,7 +113,12 @@ class TerrainDebugStats:
 
 @dataclass(frozen=True)
 class TerrainFrame:
+    """Terrain state and renderer operations produced for one frame."""
+
     desired: frozenset[PatchKey]
     resident: frozenset[PatchKey]
-    render: tuple[PatchDescriptor, ...]
+    render: tuple[TerrainPatchRenderDescriptor, ...]
     stats: TerrainDebugStats
+    uploads: tuple[PatchUploadRequest, ...] = ()
+    releases: tuple[PatchReleaseRequest, ...] = ()
+    render_slots: tuple[tuple[PatchKey, int], ...] = ()

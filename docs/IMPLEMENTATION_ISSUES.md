@@ -295,3 +295,36 @@ Selector 的邻接平衡在 Patch 容量边界同时允许“拆粗侧”和“�
 ### 剩余限制
 
 单调粗化可能在 Patch 容量不足时牺牲细节范围，但保持无裂缝和有限完成时间。后续可在 Split 前预估完整一环邻居成本，以减少一次选择中被平衡器撤销的细分。
+
+## BUG-0010: Terrain streaming was directly coupled to renderer resources
+
+- Status: `fixed`
+- Phase: M2.5 terrain/renderer boundary refactor
+- Symptom: `TerrainTileManager.update()` required a renderer object and
+  performed slot uploads, releases and render-set mutation inline. This made
+  terrain selection impossible to test or reuse without a raster backend.
+- Root cause: patch residency and GPU resource ownership were represented by
+  one call path instead of an explicit frame contract.
+
+### Fix
+
+`TerrainTileManager.update(camera, viewport_width, viewport_height)` now
+returns a data-only `TerrainFrame`. It contains the desired/resident/render
+sets, `PatchUploadRequest` and `PatchReleaseRequest` operations, and a
+descriptor-to-slot mapping. `PlanetRenderer.apply_terrain_frame()` is the
+runtime adapter that applies those operations. A compatibility adapter keeps
+the old M2 call form working for external callers, but the main preview path
+uses the new API.
+
+Surface semantics were moved to `surface.py`, and the height-provider contract
+now exposes a small GPU program descriptor. No terrain module imports the
+renderer in its implementation path.
+
+### Verification
+
+The M2 regression suite passes with both the data-only API and the legacy
+adapter; CPU raster smoke tests still produce finite G-buffer/HDR values. The
+Taichi terrain-generation kernels now live in a dedicated `TerrainRenderer`
+component. The remaining raster backend consumes its geometry fields and owns
+camera-relative transformation, clipping, rasterization, G-buffer writes, and
+compositing.

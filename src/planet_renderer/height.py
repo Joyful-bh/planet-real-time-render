@@ -1,8 +1,10 @@
 """统一高度提供器接口；程序高度可在 CPU 查询并由 GPU 实现同一算法。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Protocol
+
 import numpy as np
 
 from .planet import Vec3d, normalize
@@ -14,6 +16,18 @@ class HeightProvider(Protocol):
 
     def sample_height_m(self, direction_global: Vec3d) -> float: ...
     def gpu_parameters(self) -> tuple[int, float, float]: ...
+
+    def gpu_descriptor(self) -> "GpuHeightProgramDescriptor": ...
+
+
+@dataclass(frozen=True)
+class GpuHeightProgramDescriptor:
+    """Small immutable contract consumed by a GPU terrain generator."""
+
+    kind: int
+    seed: int
+    continent_amplitude_m: float
+    mountain_amplitude_m: float
 
 
 def _hash3(x: int, y: int, z: int, seed: int) -> float:
@@ -33,8 +47,15 @@ def _value_noise3(position: Vec3d, seed: int) -> float:
     for dz in range(2):
         for dy in range(2):
             for dx in range(2):
-                corner = _hash3(int(base[0]+dx), int(base[1]+dy), int(base[2]+dz), seed)
-                value += corner * (w[0] if dx else 1-w[0]) * (w[1] if dy else 1-w[1]) * (w[2] if dz else 1-w[2])
+                corner = _hash3(
+                    int(base[0] + dx), int(base[1] + dy), int(base[2] + dz), seed
+                )
+                value += (
+                    corner
+                    * (w[0] if dx else 1 - w[0])
+                    * (w[1] if dy else 1 - w[1])
+                    * (w[2] if dz else 1 - w[2])
+                )
     return value
 
 
@@ -59,24 +80,46 @@ class ProceduralHeightProvider:
 
     def sample_height_m(self, direction_global: Vec3d) -> float:
         direction = normalize(np.asarray(direction_global, np.float64))
-        warp = np.array([
-            _fbm(direction*3.1+11.0, self.seed+17, 3),
-            _fbm(direction*3.1-7.0, self.seed+31, 3),
-            _fbm(direction*3.1+3.0, self.seed+47, 3),
-        ]) - 0.5
-        continent = (_fbm(direction*1.65+warp*0.7, self.seed, 5)-0.5) * self.continent_amplitude_m * 2.0
-        ridge_noise = _fbm(direction*8.0+warp, self.seed+211, 5)
-        ridge = (1.0-abs(ridge_noise*2.0-1.0))**3
-        land = np.clip((continent+700.0)/1800.0, 0.0, 1.0)
-        return float(np.clip(continent+ridge*self.mountain_amplitude_m*land, -5000.0, 8500.0))
+        warp = (
+            np.array(
+                [
+                    _fbm(direction * 3.1 + 11.0, self.seed + 17, 3),
+                    _fbm(direction * 3.1 - 7.0, self.seed + 31, 3),
+                    _fbm(direction * 3.1 + 3.0, self.seed + 47, 3),
+                ]
+            )
+            - 0.5
+        )
+        continent = (
+            (_fbm(direction * 1.65 + warp * 0.7, self.seed, 5) - 0.5)
+            * self.continent_amplitude_m
+            * 2.0
+        )
+        ridge_noise = _fbm(direction * 8.0 + warp, self.seed + 211, 5)
+        ridge = (1.0 - abs(ridge_noise * 2.0 - 1.0)) ** 3
+        land = np.clip((continent + 700.0) / 1800.0, 0.0, 1.0)
+        return float(
+            np.clip(
+                continent + ridge * self.mountain_amplitude_m * land, -5000.0, 8500.0
+            )
+        )
 
     def gpu_parameters(self) -> tuple[int, float, float]:
         return self.seed, self.continent_amplitude_m, self.mountain_amplitude_m
+
+    def gpu_descriptor(self) -> GpuHeightProgramDescriptor:
+        return GpuHeightProgramDescriptor(
+            kind=self.gpu_kind,
+            seed=self.seed,
+            continent_amplitude_m=self.continent_amplitude_m,
+            mountain_amplitude_m=self.mountain_amplitude_m,
+        )
 
 
 @dataclass(frozen=True)
 class DemHeightProvider:
     """DEM 扩展契约；tile pyramid/I/O/解压由未来实现提供。"""
+
     pyramid_uri: str
     seed: int = 0
     gpu_kind: int = 2
@@ -86,3 +129,11 @@ class DemHeightProvider:
 
     def gpu_parameters(self) -> tuple[int, float, float]:
         return self.seed, 0.0, 0.0
+
+    def gpu_descriptor(self) -> GpuHeightProgramDescriptor:
+        return GpuHeightProgramDescriptor(
+            kind=self.gpu_kind,
+            seed=self.seed,
+            continent_amplitude_m=0.0,
+            mountain_amplitude_m=0.0,
+        )

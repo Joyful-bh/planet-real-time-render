@@ -92,3 +92,12 @@ python tools/profile_m2.py --backend cuda --scenario both --json output/m2_profi
 5. 最后引入动态内部渲染分辨率；它是质量与性能策略，不能掩盖 overflow 或同步卡顿。
 
 每项优化都必须使用相同配置、相机路径、seed、分辨率与后端进行前后对比，并将首次 JIT 与稳定时间分开报告。
+
+## M2.5 boundary timings
+
+After the terrain/renderer split, `terrain_dispatch_ms` measures only the
+data-only terrain update. `terrain_upload_dispatch_ms` measures applying the
+returned slot operations to the renderer. `terrain_gpu_ms` still measures the
+synchronized completion of patch generation and upload kernels. Keeping these
+values separate prevents GPU resource work from being misattributed to the
+LOD selector.

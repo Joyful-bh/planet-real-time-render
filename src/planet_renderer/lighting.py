@@ -29,4 +29,3 @@ class StaticLightingProvider:
 
     def snapshot(self) -> LightingState:
         return self.state
-

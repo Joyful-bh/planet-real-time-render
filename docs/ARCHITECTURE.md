@@ -126,7 +126,7 @@
 
 ### M2：程序生成球面地形
 
-状态：已完成增量 Mixed-LOD 闭环。`terrain_lod` 维护持久叶集合，以 patch SSE 和独立 split/merge 阈值渐进改变拓扑，并把相邻层级差限制为一；`terrain_streaming` 维护 Desired/Resident/Render 三集合、生命周期、父级 fallback、请求优先级、预算和 LRU slot；`height` 定义程序/DEM provider 契约；`renderer` 持有共享 grid index 与固定 slot，并在 GPU 生成程序高度、相机相对顶点和法线。Render Set 单独做视锥与地平线裁剪。第一版只在连接粗邻居或缺失邻居的细边启用 skirt；后续用 edge stitching 和 geomorph 替换。
+状态：已完成增量 Mixed-LOD 闭环。`terrain_lod` 维护持久叶集合，以 patch SSE 和独立 split/merge 阈值渐进改变拓扑，并把相邻层级差限制为一；`terrain_streaming` 维护 Desired/Resident/Render 三集合、生命周期、父级 fallback、请求优先级、预算和 LRU slot；`height` 定义程序/DEM provider 契约；`terrain_renderer` 持有 GPU 几何 slot，并在 Taichi 中生成程序高度、相机相对顶点和法线；`renderer` 仅消费这些字段并执行变换、光栅化和合成。Render Set 单独做视锥与地平线裁剪。第一版只在连接粗邻居或缺失邻居的细边启用 skirt；后续用 edge stitching 和 geomorph 替换。
 
 - 六面分块和基础四叉树 LOD；
 - 确定性低频大陆与多尺度山地；
@@ -212,3 +212,29 @@
 - 是否在 Taichi kernel 之外使用专门的数据预处理依赖。
 
 这些决策必须由对应里程碑的可运行原型、画面和测量结果驱动。
+
+## M2.5 Terrain/Renderer boundary
+
+The terrain system is the owner of world data and patch residency. For each
+frame it returns a data-only `TerrainFrame` containing the desired set, the
+fallback-resolved render set, and bounded upload/release operations. It never
+imports or calls a renderer.
+
+`TerrainPatchRenderDescriptor` contains only patch identity, global anchor,
+screen-space error and edge masks. GPU slots are kept in a separate
+`render_slots` mapping because they are renderer resources, not world state.
+`PlanetRenderer.apply_terrain_frame()` is the explicit runtime boundary that
+applies these operations to GPU slots and updates the render set.
+
+Surface semantics (`SurfaceDescriptor`, stable `SurfaceCellId` and material
+weights) live in `surface.py`; terrain geometry and future coverage consumers
+can share this contract without coupling to rasterization. The old
+`CubeSphereTerrain.update(camera, height, renderer)` call remains only as a
+compatibility adapter and is not used by the main runtime path.
+
+`TerrainRenderer` now owns the Taichi terrain-generation kernels and the
+geometry-side slot fields (`offset`, `normal`, `height_m`, material weights and
+surface cells). `PlanetRenderer` keeps only compatibility aliases to those
+fields; its own kernels handle camera-relative transforms, clipping,
+rasterization, G-buffer writes and compositing. Upload/release calls cross this
+boundary through the small `upload_patch`/`release_patch` adapter methods.

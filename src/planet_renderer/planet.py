@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 import numpy as np
-
 
 Vec3d = np.ndarray
 
@@ -40,7 +39,11 @@ class LocalFrame:
     def global_to_local_direction(self, global_direction: Vec3d) -> Vec3d:
         value = _vec3(global_direction)
         return np.array(
-            [np.dot(value, self.east), np.dot(value, self.up), np.dot(value, self.north)],
+            [
+                np.dot(value, self.east),
+                np.dot(value, self.up),
+                np.dot(value, self.north),
+            ],
             dtype=np.float64,
         )
 
@@ -53,12 +56,16 @@ class PlanetModel:
     def __post_init__(self) -> None:
         if not math.isfinite(self.radius_m) or self.radius_m <= 1.0:
             raise ValueError("planet.radius_m 必须大于 1 米")
-        object.__setattr__(self, "rotation_axis", tuple(normalize(_vec3(self.rotation_axis))))
+        object.__setattr__(
+            self, "rotation_axis", tuple(normalize(_vec3(self.rotation_axis)))
+        )
 
     def altitude_m(self, position_global: Vec3d) -> float:
         return float(np.linalg.norm(_vec3(position_global)) - self.radius_m)
 
-    def surface_position(self, direction_global: Vec3d, altitude_m: float = 0.0) -> Vec3d:
+    def surface_position(
+        self, direction_global: Vec3d, altitude_m: float = 0.0
+    ) -> Vec3d:
         return normalize(_vec3(direction_global)) * (self.radius_m + altitude_m)
 
     def local_frame(self, position_global: Vec3d) -> LocalFrame:
@@ -66,7 +73,11 @@ class PlanetModel:
         axis = _vec3(self.rotation_axis)
         east = np.cross(axis, up)
         if np.linalg.norm(east) < 1.0e-8:
-            fallback = np.array([0.0, 0.0, 1.0]) if abs(up[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+            fallback = (
+                np.array([0.0, 0.0, 1.0])
+                if abs(up[2]) < 0.9
+                else np.array([1.0, 0.0, 0.0])
+            )
             east = np.cross(fallback, up)
         east = normalize(east)
         north = normalize(np.cross(up, east))
@@ -100,4 +111,3 @@ class FloatingOrigin:
 
     def relative_f32(self, position_global: Vec3d) -> np.ndarray:
         return (_vec3(position_global) - self.origin_global).astype(np.float32)
-

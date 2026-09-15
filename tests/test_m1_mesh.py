@@ -19,7 +19,11 @@ class CubeSphereTests(unittest.TestCase):
         vertices, triangles = create_cube_sphere(6)
         self.assertGreaterEqual(int(triangles.min()), 0)
         self.assertLess(int(triangles.max()), len(vertices))
-        p0, p1, p2 = vertices[triangles[:, 0]], vertices[triangles[:, 1]], vertices[triangles[:, 2]]
+        p0, p1, p2 = (
+            vertices[triangles[:, 0]],
+            vertices[triangles[:, 1]],
+            vertices[triangles[:, 2]],
+        )
         area = np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1)
         self.assertTrue(np.all(area > 1.0e-8))
 
