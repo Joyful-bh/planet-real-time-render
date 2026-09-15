@@ -76,11 +76,6 @@ class TerrainPatchRenderDescriptor:
         return self.key.y
 
 
-# Compatibility name retained for M2 callers while the boundary migrates to
-# the more explicit descriptor name.
-PatchDescriptor = TerrainPatchRenderDescriptor
-
-
 @dataclass(frozen=True)
 class PatchUploadRequest:
     """A patch that should be uploaded into one renderer slot."""

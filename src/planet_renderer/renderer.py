@@ -19,7 +19,7 @@ from .planet import PlanetModel
 from .postprocess import display_transform
 from .terrain_lod import cube_face_direction
 from .terrain_renderer import TerrainRenderer
-from .terrain_types import PatchDescriptor, PatchKey, TerrainFrame
+from .terrain_types import PatchKey, TerrainFrame, TerrainPatchRenderDescriptor
 
 TILE_SIZE = 16
 MAX_TRIANGLES_PER_TILE = 512
@@ -144,19 +144,6 @@ class PlanetRenderer:
             4, ti.i32, shape=self.max_stitch_operations
         )
         self.anchor_relative = ti.Vector.field(3, ti.f32, shape=max_patches)
-        # Geometry fields live in TerrainRenderer.  Aliases preserve the
-        # existing raster kernels and diagnostics while keeping ownership out
-        # of this camera/raster/compositing class.
-        self.slot_resident = self.terrain_renderer.slot_resident
-        self.slot_face = self.terrain_renderer.slot_face
-        self.slot_level = self.terrain_renderer.slot_level
-        self.slot_x = self.terrain_renderer.slot_x
-        self.slot_y = self.terrain_renderer.slot_y
-        self.offset = self.terrain_renderer.offset
-        self.normal = self.terrain_renderer.normal
-        self.height_m = self.terrain_renderer.height_m
-        self.material = self.terrain_renderer.material
-        self.cell = self.terrain_renderer.cell
         self.view = ti.Vector.field(
             3, ti.f32, shape=(max_patches, self.vertices_per_patch)
         )
@@ -188,7 +175,7 @@ class PlanetRenderer:
         self.gbuffer_surface_cell_id = ti.field(ti.i32, shape=shape)
         self.hdr = ti.Vector.field(3, ti.f32, shape=shape)
         self.display = ti.Vector.field(3, ti.f32, shape=shape)
-        self._render_descriptors: tuple[PatchDescriptor, ...] = ()
+        self._render_descriptors: tuple[TerrainPatchRenderDescriptor, ...] = ()
         self._render_slots: dict[PatchKey, int] = {}
         self._edge_signature: tuple | None = None
         self._render_signature: tuple | None = None
@@ -225,7 +212,9 @@ class PlanetRenderer:
         return raw[0] // divisor, raw[1] // divisor, raw[2] // divisor
 
     def _build_edge_operations(
-        self, descriptors: list[PatchDescriptor], slots: dict[PatchKey, int | None]
+        self,
+        descriptors: list[TerrainPatchRenderDescriptor],
+        slots: dict[PatchKey, int | None],
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         groups: dict[tuple[int, int, int], set[tuple[int, int]]] = {}
         stitch: list[tuple[int, int, int, int]] = []
@@ -287,16 +276,6 @@ class PlanetRenderer:
                 [stitch[i, 0], stitch[i, 1], stitch[i, 2], stitch[i, 3]]
             )
 
-    def upload_patch(self, slot: int, descriptor: PatchDescriptor) -> None:
-        """Generate geometry through the dedicated terrain GPU component."""
-
-        self.terrain_renderer.upload_patch(slot, descriptor)
-
-    def release_patch(self, slot: int | None) -> None:
-        if slot is not None:
-            self.terrain_renderer.release_patch(slot)
-            self._release_render_slot(slot)
-
     def apply_terrain_frame(self, frame: TerrainFrame) -> None:
         """Apply renderer operations emitted by :class:`CubeSphereTerrain`.
 
@@ -306,17 +285,20 @@ class PlanetRenderer:
         """
 
         for release in frame.releases:
-            self.release_patch(release.slot)
+            self.terrain_renderer.release_patch(release.slot)
+            self._release_render_slot(release.slot)
         for upload in frame.uploads:
-            self.upload_patch(upload.slot, upload.descriptor)
-        self.set_render_patches(list(frame.render), dict(frame.render_slots))
+            self.terrain_renderer.upload_patch(upload.slot, upload.descriptor)
+        self._set_render_patches(list(frame.render), dict(frame.render_slots))
 
     @ti.kernel
     def _release_render_slot(self, slot: ti.i32):
         self.slot_render[slot] = 0
 
-    def set_render_patches(
-        self, descriptors: list[PatchDescriptor], slots: dict[PatchKey, int | None]
+    def _set_render_patches(
+        self,
+        descriptors: list[TerrainPatchRenderDescriptor],
+        slots: dict[PatchKey, int | None],
     ) -> None:
         self._render_descriptors = tuple(descriptors)
         self._render_slots = {k: int(v) for k, v in slots.items() if v is not None}
@@ -414,7 +396,10 @@ class PlanetRenderer:
     ):
         for slot, index in self.view:
             if self.slot_render[slot]:
-                g = self.anchor_relative[slot] + self.offset[slot, index]
+                g = (
+                    self.anchor_relative[slot]
+                    + self.terrain_renderer.offset[slot, index]
+                )
                 local = ti.Vector([g.dot(e), g.dot(u), g.dot(n)])
                 self.view[slot, index] = ti.Vector(
                     [local.dot(r), local.dot(vu), local.dot(f)]
@@ -426,10 +411,18 @@ class PlanetRenderer:
             dst = self.weld_dst[operation]
             src = self.weld_src[operation]
             self.view[dst.x, dst.y] = self.view[src.x, src.y]
-            self.normal[dst.x, dst.y] = self.normal[src.x, src.y]
-            self.height_m[dst.x, dst.y] = self.height_m[src.x, src.y]
-            self.material[dst.x, dst.y] = self.material[src.x, src.y]
-            self.cell[dst.x, dst.y] = self.cell[src.x, src.y]
+            self.terrain_renderer.normal[dst.x, dst.y] = self.terrain_renderer.normal[
+                src.x, src.y
+            ]
+            self.terrain_renderer.height_m[dst.x, dst.y] = (
+                self.terrain_renderer.height_m[src.x, src.y]
+            )
+            self.terrain_renderer.material[dst.x, dst.y] = (
+                self.terrain_renderer.material[src.x, src.y]
+            )
+            self.terrain_renderer.cell[dst.x, dst.y] = self.terrain_renderer.cell[
+                src.x, src.y
+            ]
 
     @ti.kernel
     def _stitch_lod_edges(self):
@@ -440,14 +433,17 @@ class PlanetRenderer:
             a = item.z
             b = item.w
             self.view[slot, vertex] = (self.view[slot, a] + self.view[slot, b]) * 0.5
-            self.normal[slot, vertex] = (
-                self.normal[slot, a] + self.normal[slot, b]
+            self.terrain_renderer.normal[slot, vertex] = (
+                self.terrain_renderer.normal[slot, a]
+                + self.terrain_renderer.normal[slot, b]
             ).normalized()
-            self.height_m[slot, vertex] = (
-                self.height_m[slot, a] + self.height_m[slot, b]
+            self.terrain_renderer.height_m[slot, vertex] = (
+                self.terrain_renderer.height_m[slot, a]
+                + self.terrain_renderer.height_m[slot, b]
             ) * 0.5
-            self.material[slot, vertex] = (
-                self.material[slot, a] + self.material[slot, b]
+            self.terrain_renderer.material[slot, vertex] = (
+                self.terrain_renderer.material[slot, a]
+                + self.terrain_renderer.material[slot, b]
             ) * 0.5
 
     @ti.func
@@ -529,10 +525,10 @@ class PlanetRenderer:
                 for vertex in range(3):
                     index = ids[vertex]
                     positions[vertex, :] = self.view[slot, index]
-                    normals[vertex, :] = self.normal[slot, index]
-                    materials[vertex, :] = self.material[slot, index]
-                    heights[vertex] = self.height_m[slot, index]
-                    cells[vertex] = self.cell[slot, index]
+                    normals[vertex, :] = self.terrain_renderer.normal[slot, index]
+                    materials[vertex, :] = self.terrain_renderer.material[slot, index]
+                    heights[vertex] = self.terrain_renderer.height_m[slot, index]
+                    cells[vertex] = self.terrain_renderer.cell[slot, index]
                 count = 3
                 read_buffer = 0
                 for plane in range(5):
@@ -709,7 +705,7 @@ class PlanetRenderer:
     def _debug_color(self, h: ti.f32, slot: ti.i32, mode: ti.i32):
         color = self._height_band(h)
         if mode == 1:
-            hue = ti.cast(self.slot_level[slot] % 6, ti.f32) / 6.0
+            hue = ti.cast(self.terrain_renderer.slot_level[slot] % 6, ti.f32) / 6.0
             color = ti.Vector(
                 [
                     ti.abs(hue * 6.0 - 3.0) - 1.0,

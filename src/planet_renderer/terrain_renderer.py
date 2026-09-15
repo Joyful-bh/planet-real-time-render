@@ -10,7 +10,7 @@ import numpy as np
 import taichi as ti
 
 from .height import GpuHeightProgramDescriptor, HeightProvider
-from .terrain_types import PatchDescriptor
+from .terrain_types import TerrainPatchRenderDescriptor
 
 
 @ti.data_oriented
@@ -68,18 +68,7 @@ class TerrainRenderer:
                 mountain_amplitude_m=4200.0,
             )
 
-        descriptor_factory = getattr(height_provider, "gpu_descriptor", None)
-        if descriptor_factory is not None:
-            descriptor = descriptor_factory()
-            return descriptor
-
-        seed, continent, mountain = height_provider.gpu_parameters()
-        return GpuHeightProgramDescriptor(
-            kind=1,
-            seed=seed,
-            continent_amplitude_m=continent,
-            mountain_amplitude_m=mountain,
-        )
+        return height_provider.gpu_descriptor()
 
     @ti.func
     def _hash3(self, x: ti.i32, y: ti.i32, z: ti.i32, seed: ti.i32) -> ti.f32:
@@ -301,7 +290,11 @@ class TerrainRenderer:
     def _release(self, slot: ti.i32):
         self.slot_resident[slot] = 0
 
-    def upload_patch(self, slot: int, descriptor: PatchDescriptor) -> None:
+    def upload_patch(
+        self,
+        slot: int,
+        descriptor: TerrainPatchRenderDescriptor,
+    ) -> None:
         """Generate one patch and its normals in a reusable GPU slot."""
 
         key = descriptor.key

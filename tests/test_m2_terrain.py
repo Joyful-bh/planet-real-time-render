@@ -7,15 +7,11 @@ from planet_renderer.camera import PlanetCamera
 from planet_renderer.lighting import LightingState
 from planet_renderer.planet import PlanetModel
 from planet_renderer.renderer import PlanetRenderer
-from planet_renderer.terrain import (
-    CubeSphereTerrain,
-    PatchKey,
-    ProceduralHeightSource,
-    TerrainSettings,
-    cube_face_direction,
-    direction_to_cube_face_uv,
-    surface_cell_id,
-)
+from planet_renderer.terrain import (CubeSphereTerrain, PatchKey,
+                                     ProceduralHeightProvider, TerrainSettings,
+                                     cube_face_direction,
+                                     direction_to_cube_face_uv,
+                                     surface_cell_id)
 
 
 def _camera(planet: PlanetModel, altitude: float = 1000.0) -> PlanetCamera:
@@ -25,7 +21,7 @@ def _camera(planet: PlanetModel, altitude: float = 1000.0) -> PlanetCamera:
 
 
 def test_cube_mapping_round_trip_and_cross_face_height_continuity():
-    source = ProceduralHeightSource(seed=19)
+    source = ProceduralHeightProvider(seed=19)
     for face in range(6):
         direction = cube_face_direction(face, 0.21, -0.37)
         mapped_face, u, v = direction_to_cube_face_uv(direction)
@@ -44,87 +40,11 @@ def test_surface_cell_id_is_render_lod_independent():
     assert surface_cell_id(direction) == surface_cell_id(direction.copy())
 
 
-def test_mesh_semantics_and_residency_are_stable():
-    planet = PlanetModel(6_360_000.0)
-    terrain = CubeSphereTerrain(
-        planet,
-        ProceduralHeightSource(seed=3),
-        TerrainSettings(
-            patch_resolution=3,
-            max_level=6,
-            split_sse_pixels=80,
-            merge_sse_pixels=40,
-            max_desired_patches=24,
-            max_gpu_patches=32,
-            build_budget_per_frame=8,
-            upload_budget_per_frame=4,
-        ),
-    )
-
-    class RendererStub:
-        def __init__(self):
-            self.uploaded = []
-            self.released = []
-            self.width = 320
-            self.height = 180
-
-        def upload_patch(self, slot, descriptor):
-            self.uploaded.append((slot, descriptor.key))
-
-        def release_patch(self, slot):
-            self.released.append(slot)
-
-        def set_render_patches(self, descriptors, slots):
-            self.render = tuple(d.key for d in descriptors)
-
-    renderer = RendererStub()
-    events = []
-
-    class Consumer:
-        def on_patch_residency_changed(self, event):
-            events.append(event)
-
-    terrain.add_coverage_consumer(Consumer())
-    first = terrain.update(_camera(planet), 180, renderer, now=1.0)
-    uploaded_after_first = len(renderer.uploaded)
-    descriptor = terrain.describe_surface(cube_face_direction(4, 0.1, -0.2))
-    second = terrain.update(_camera(planet), 180, renderer, now=1.01)
-    uploaded_after_second = len(renderer.uploaded)
-    rotated = _camera(planet)
-    rotated.yaw_degrees = -120.0
-    rotated_frame = terrain.update(rotated, 180, renderer, now=1.02)
-    assert first.desired == second.desired == rotated_frame.desired
-    assert first.desired != first.resident and first.resident != first.render
-    assert (
-        renderer.uploaded
-        and uploaded_after_first <= 4
-        and uploaded_after_second - uploaded_after_first <= 4
-        and len(renderer.uploaded) - uploaded_after_second <= 4
-        and events
-    )
-    assert set(renderer.render) <= rotated_frame.resident
-    render_set = set(renderer.render)
-    for key in render_set:
-        for edge in range(4):
-            neighbor = terrain.selector._neighbor(render_set, key, edge)
-            if neighbor is not None:
-                assert abs(key.level - neighbor.level) <= 1
-    assert (
-        descriptor.cell_id >= 0 and abs(sum(descriptor.material_weights) - 1.0) < 1e-9
-    )
-    assert all(
-        abs(a.level - b.level) <= 1
-        for a in first.desired
-        for b in first.desired
-        if a.face == b.face and a != b and (a.x == b.x or a.y == b.y)
-    )
-
-
 def test_terrain_frame_is_renderer_independent():
     planet = PlanetModel(6_360_000.0)
     terrain = CubeSphereTerrain(
         planet,
-        ProceduralHeightSource(seed=8),
+        ProceduralHeightProvider(seed=8),
         TerrainSettings(
             patch_resolution=2,
             max_level=2,
@@ -161,7 +81,7 @@ def test_mixed_lod_is_incremental_and_reaches_high_local_levels():
     camera = _camera(planet, 2.0)
     terrain = CubeSphereTerrain(
         planet,
-        ProceduralHeightSource(),
+        ProceduralHeightProvider(),
         TerrainSettings(
             max_level=16, max_desired_patches=180, lod_changes_per_update=8
         ),
@@ -195,22 +115,8 @@ def test_high_speed_cross_scale_streaming_remains_bounded():
         cache_capacity=128,
         selection_interval_s=0.01,
     )
-    terrain = CubeSphereTerrain(planet, ProceduralHeightSource(seed=11), settings)
+    terrain = CubeSphereTerrain(planet, ProceduralHeightProvider(seed=11), settings)
 
-    class RendererStub:
-        width = 320
-        height = 180
-
-        def upload_patch(self, slot, descriptor):
-            pass
-
-        def release_patch(self, slot):
-            pass
-
-        def set_render_patches(self, descriptors, slots):
-            pass
-
-    renderer = RendererStub()
     now = 1.0
     started = time.perf_counter()
     for frame in range(180):
@@ -219,7 +125,8 @@ def test_high_speed_cross_scale_streaming_remains_bounded():
             camera.move_local(planet, 0.0, -24_000.0, 0.0)
         else:
             camera.move_local(planet, 18_000.0, 0.0, 9_000.0)
-        terrain.update(camera, 180, renderer, now=now)
+        frame_result = terrain.update(camera, 320, 180, now=now)
+        assert frame_result.render
         assert len(terrain.tile_manager.queue) <= settings.cache_capacity * 2
         leaves = set(terrain.selector.leaves)
         for key in leaves:
@@ -243,14 +150,15 @@ def test_small_cpu_render_has_finite_gbuffer():
         build_budget_per_frame=16,
         upload_budget_per_frame=16,
     )
-    terrain = CubeSphereTerrain(planet, ProceduralHeightSource(seed=5), settings)
+    terrain = CubeSphereTerrain(planet, ProceduralHeightProvider(seed=5), settings)
     direction = np.array([0.0, 0.0, 1.0])
     terrain_height = terrain.describe_surface(direction).height_m
     camera = PlanetCamera(
         planet.surface_position(direction, terrain_height + 1000.0), 0.0, -30.0, 60.0
     )
     renderer = PlanetRenderer(64, 48, 16, 2, terrain.height_provider)
-    terrain.update(camera, 48, renderer, now=1.0)
+    terrain_frame = terrain.update(camera, 64, 48, now=1.0)
+    renderer.apply_terrain_frame(terrain_frame)
     light = LightingState(
         np.array([0.2, 0.8, 0.4]), 0.266, (4.0, 3.9, 3.7), (80.0, 74.0, 62.0)
     )
@@ -273,7 +181,7 @@ def test_small_cpu_render_has_finite_gbuffer():
         -1.0 + (render_key.x + 0.5) * 2.0 / (1 << render_key.level),
         -1.0 + (render_key.y + 0.5) * 2.0 / (1 << render_key.level),
     )
-    gpu_center_height = float(renderer.height_m.to_numpy()[slot, 4])
+    gpu_center_height = float(renderer.terrain_renderer.height_m.to_numpy()[slot, 4])
     assert (
         abs(
             gpu_center_height

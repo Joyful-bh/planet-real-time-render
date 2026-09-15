@@ -11,21 +11,11 @@ import numpy as np
 
 from .camera import PlanetCamera
 from .planet import PlanetModel, normalize
-from .terrain_lod import (
-    MixedLodSelector,
-    cube_face_direction,
-    patch_center_direction,
-    patch_uv_bounds,
-)
-from .terrain_types import (
-    PatchDescriptor,
-    PatchKey,
-    PatchReleaseRequest,
-    PatchState,
-    PatchUploadRequest,
-    TerrainDebugStats,
-    TerrainFrame,
-)
+from .terrain_lod import (MixedLodSelector, cube_face_direction,
+                          patch_center_direction, patch_uv_bounds)
+from .terrain_types import (PatchKey, PatchReleaseRequest, PatchState,
+                            PatchUploadRequest, TerrainDebugStats,
+                            TerrainFrame, TerrainPatchRenderDescriptor)
 
 
 @dataclass
@@ -139,8 +129,8 @@ class TerrainTileManager:
         priority: float = 0.0,
         skirt_mask: int = 0,
         stitch_mask: int = 0,
-    ) -> PatchDescriptor:
-        return PatchDescriptor(
+    ) -> TerrainPatchRenderDescriptor:
+        return TerrainPatchRenderDescriptor(
             key=key,
             anchor_global=patch_center_direction(key) * self.planet.radius_m,
             sse=self.selector.sse(key, camera, viewport_height),
@@ -432,7 +422,7 @@ class TerrainTileManager:
             }
             self._boundary_signature = visible_signature
 
-        descriptors: list[PatchDescriptor] = []
+        descriptors: list[TerrainPatchRenderDescriptor] = []
         render_slots: list[tuple[PatchKey, int]] = []
         for key in visible:
             record = self.records[key]

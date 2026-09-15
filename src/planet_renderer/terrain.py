@@ -3,33 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from numbers import Real
-from typing import Any, Protocol
+from typing import Protocol
 
 from .camera import PlanetCamera
 from .height import DemHeightProvider, HeightProvider, ProceduralHeightProvider
 from .planet import PlanetModel, Vec3d
 from .surface import SurfaceDescriptor, describe_surface, surface_cell_id
-from .terrain_lod import (
-    MixedLodSelector,
-    cube_face_direction,
-    direction_to_cube_face_uv,
-)
+from .terrain_lod import (MixedLodSelector, cube_face_direction,
+                          direction_to_cube_face_uv)
 from .terrain_streaming import TerrainTileManager
-from .terrain_types import (
-    PatchDescriptor,
-    PatchKey,
-    PatchReleaseRequest,
-    PatchState,
-    PatchUploadRequest,
-    TerrainDebugStats,
-    TerrainFrame,
-    TerrainPatchRenderDescriptor,
-)
-
-# Compatibility aliases retained for the M2 public API.
-ProceduralHeightSource = ProceduralHeightProvider
-HeightSource = HeightProvider
+from .terrain_types import (PatchKey, PatchReleaseRequest, PatchState,
+                            PatchUploadRequest, TerrainDebugStats,
+                            TerrainFrame, TerrainPatchRenderDescriptor)
 
 
 @dataclass(frozen=True)
@@ -112,51 +97,19 @@ class CubeSphereTerrain:
     def update(
         self,
         camera: PlanetCamera,
-        viewport_width: int | None = None,
-        viewport_height: int | object | None = None,
+        viewport_width: int,
+        viewport_height: int,
         now: float | None = None,
-        *,
-        renderer: Any | None = None,
     ) -> TerrainFrame:
-        """Advance streaming and return data-only terrain operations.
+        """Advance streaming and return data-only terrain operations."""
 
-        The preferred call is ``update(camera, width, height)``. The previous
-        M2 form ``update(camera, height, renderer)`` remains as a thin adapter
-        for external callers; the tile manager itself never imports or calls a
-        renderer.
-        """
-
-        legacy_renderer = renderer
-        if viewport_height is None:
-            if viewport_width is None:
-                raise TypeError("viewport dimensions are required")
-            viewport_height = viewport_width
-            viewport_width = viewport_height
-        elif not isinstance(viewport_height, Real):
-            if legacy_renderer is not None:
-                raise TypeError("renderer supplied twice")
-            legacy_renderer = viewport_height  # type: ignore[assignment]
-            if viewport_width is None:
-                raise TypeError("legacy update requires viewport height")
-            viewport_height = viewport_width
-            viewport_width = int(getattr(legacy_renderer, "width"))
-        elif viewport_width is None:
-            if legacy_renderer is not None:
-                viewport_width = int(getattr(legacy_renderer, "width"))
-            else:
-                viewport_width = int(viewport_height)
-
-        assert viewport_width is not None
         frame = self.tile_manager.update(
             camera,
-            int(viewport_width),
-            int(viewport_height),
+            viewport_width,
+            viewport_height,
             now,
         )
         self._notify_residency(frame)
-
-        if legacy_renderer is not None:
-            self._apply_legacy_frame(legacy_renderer, frame)
         return frame
 
     def _notify_residency(self, frame: TerrainFrame) -> None:
@@ -167,23 +120,6 @@ class CubeSphereTerrain:
             for consumer in self._consumers:
                 consumer.on_patch_residency_changed(event)
         self._resident = frame.resident
-
-    @staticmethod
-    def _apply_legacy_frame(renderer: Any, frame: TerrainFrame) -> None:
-        """Apply a frame for M2 callers that still pass a renderer object."""
-
-        apply_frame = getattr(renderer, "apply_terrain_frame", None)
-        if apply_frame is not None:
-            apply_frame(frame)
-            return
-        for release in frame.releases:
-            renderer.release_patch(release.slot)
-        for upload in frame.uploads:
-            renderer.upload_patch(upload.slot, upload.descriptor)
-        renderer.set_render_patches(
-            list(frame.render),
-            dict(frame.render_slots),
-        )
 
     def select_patches(
         self,
@@ -210,12 +146,10 @@ __all__ = [
     "TerrainPatchRenderDescriptor",
     "PatchKey",
     "PatchState",
-    "PatchDescriptor",
     "PatchUploadRequest",
     "PatchReleaseRequest",
     "TerrainDebugStats",
     "TerrainFrame",
-    "ProceduralHeightSource",
     "ProceduralHeightProvider",
     "DemHeightProvider",
     "cube_face_direction",

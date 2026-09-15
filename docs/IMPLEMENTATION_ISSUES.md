@@ -312,9 +312,8 @@ Selector 的邻接平衡在 Patch 容量边界同时允许“拆粗侧”和“�
 returns a data-only `TerrainFrame`. It contains the desired/resident/render
 sets, `PatchUploadRequest` and `PatchReleaseRequest` operations, and a
 descriptor-to-slot mapping. `PlanetRenderer.apply_terrain_frame()` is the
-runtime adapter that applies those operations. A compatibility adapter keeps
-the old M2 call form working for external callers, but the main preview path
-uses the new API.
+runtime adapter that applies those operations. The old renderer-coupled M2
+call form was removed after all in-repository callers were migrated.
 
 Surface semantics were moved to `surface.py`, and the height-provider contract
 now exposes a small GPU program descriptor. No terrain module imports the
@@ -322,8 +321,8 @@ renderer in its implementation path.
 
 ### Verification
 
-The M2 regression suite passes with both the data-only API and the legacy
-adapter; CPU raster smoke tests still produce finite G-buffer/HDR values. The
+The M2 regression suite uses the data-only API; CPU raster smoke tests still
+produce finite G-buffer/HDR values. The
 Taichi terrain-generation kernels now live in a dedicated `TerrainRenderer`
 component. The remaining raster backend consumes its geometry fields and owns
 camera-relative transformation, clipping, rasterization, G-buffer writes, and

@@ -15,8 +15,6 @@ class HeightProvider(Protocol):
     gpu_kind: int
 
     def sample_height_m(self, direction_global: Vec3d) -> float: ...
-    def gpu_parameters(self) -> tuple[int, float, float]: ...
-
     def gpu_descriptor(self) -> "GpuHeightProgramDescriptor": ...
 
 
@@ -104,9 +102,6 @@ class ProceduralHeightProvider:
             )
         )
 
-    def gpu_parameters(self) -> tuple[int, float, float]:
-        return self.seed, self.continent_amplitude_m, self.mountain_amplitude_m
-
     def gpu_descriptor(self) -> GpuHeightProgramDescriptor:
         return GpuHeightProgramDescriptor(
             kind=self.gpu_kind,
@@ -126,9 +121,6 @@ class DemHeightProvider:
 
     def sample_height_m(self, direction_global: Vec3d) -> float:
         raise RuntimeError("DEM provider 尚未连接分级 tile pyramid")
-
-    def gpu_parameters(self) -> tuple[int, float, float]:
-        return self.seed, 0.0, 0.0
 
     def gpu_descriptor(self) -> GpuHeightProgramDescriptor:
         return GpuHeightProgramDescriptor(

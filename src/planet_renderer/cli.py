@@ -16,7 +16,8 @@ from .config import M0Config, load_config
 from .lighting import LightingState, StaticLightingProvider
 from .planet import FloatingOrigin, PlanetModel
 from .renderer import PlanetRenderer
-from .terrain import CubeSphereTerrain, ProceduralHeightSource, TerrainSettings
+from .terrain import (CubeSphereTerrain, ProceduralHeightProvider,
+                      TerrainSettings)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -250,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
             cache_capacity=config.terrain_cache_capacity,
         )
         terrain = CubeSphereTerrain(
-            planet, ProceduralHeightSource(config.terrain_seed), settings
+            planet, ProceduralHeightProvider(config.terrain_seed), settings
         )
         requested_altitude = planet.altitude_m(camera.position_global)
         if requested_altitude < 20_000.0:

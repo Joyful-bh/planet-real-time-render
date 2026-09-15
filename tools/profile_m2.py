@@ -25,11 +25,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from planet_renderer.cli import initial_state  # noqa: E402
 from planet_renderer.config import load_config  # noqa: E402
 from planet_renderer.renderer import PlanetRenderer  # noqa: E402
-from planet_renderer.terrain import (  # noqa: E402
-    CubeSphereTerrain,
-    ProceduralHeightSource,
-    TerrainSettings,
-)
+from planet_renderer.terrain import CubeSphereTerrain  # noqa: E402
+from planet_renderer.terrain import ProceduralHeightProvider, TerrainSettings
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,7 +95,7 @@ def make_scene(args: argparse.Namespace):
         cache_capacity=config.terrain_cache_capacity,
     )
     terrain = CubeSphereTerrain(
-        planet, ProceduralHeightSource(config.terrain_seed), settings
+        planet, ProceduralHeightProvider(config.terrain_seed), settings
     )
     direction = camera.position_global / np.linalg.norm(camera.position_global)
     terrain_height = terrain.describe_surface(direction).height_m

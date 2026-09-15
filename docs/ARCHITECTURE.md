@@ -36,10 +36,10 @@
 
 ### `terrain`
 
-负责球面分块、四叉树 LOD、可见性、网格生成、高度采样、法线和材质权重。高度源分为：
+负责球面分块、四叉树 LOD、可见性和高度源调度，并输出网格生成所需的轻量 descriptor。高度源分为：
 
-- `ProceduralHeightSource`：固定种子的多尺度行星噪声；
-- `DemHeightSource`：真实数据切片、重投影、缓存和缺失值处理。
+- `ProceduralHeightProvider`：固定种子的多尺度行星噪声；
+- `DemHeightProvider`：真实数据切片、重投影、缓存和缺失值处理。
 
 高度源只返回规范化位置对应的高度及必要元数据，不负责渲染。
 
@@ -228,13 +228,11 @@ applies these operations to GPU slots and updates the render set.
 
 Surface semantics (`SurfaceDescriptor`, stable `SurfaceCellId` and material
 weights) live in `surface.py`; terrain geometry and future coverage consumers
-can share this contract without coupling to rasterization. The old
-`CubeSphereTerrain.update(camera, height, renderer)` call remains only as a
-compatibility adapter and is not used by the main runtime path.
+can share this contract without coupling to rasterization. `CubeSphereTerrain`
+now exposes only the data-only `update(camera, width, height)` contract.
 
 `TerrainRenderer` now owns the Taichi terrain-generation kernels and the
 geometry-side slot fields (`offset`, `normal`, `height_m`, material weights and
-surface cells). `PlanetRenderer` keeps only compatibility aliases to those
-fields; its own kernels handle camera-relative transforms, clipping,
-rasterization, G-buffer writes and compositing. Upload/release calls cross this
-boundary through the small `upload_patch`/`release_patch` adapter methods.
+surface cells). `PlanetRenderer` accesses those fields only through its
+explicit `terrain_renderer` component; its own kernels handle camera-relative
+transforms, clipping, rasterization, G-buffer writes and compositing.
