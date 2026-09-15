@@ -1,0 +1,31 @@
+{
+  "rendering": {"width": 1280, "height": 720, "exposure_ev": 0.0},
+  "planet": {"radius_m": 6360000.0, "surface_albedo": [0.16, 0.20, 0.12]},
+  "camera": {
+    "initial_altitude_m": 2.0,
+    "yaw_degrees": 0.0,
+    "pitch_degrees": -8.0,
+    "vertical_fov_degrees": 60.0,
+    "floating_origin_threshold_m": 10000.0
+  },
+  "lighting": {
+    "sun_azimuth_degrees": 25.0,
+    "sun_elevation_degrees": 32.0,
+    "sun_angular_radius_degrees": 0.266,
+    "solar_irradiance": [4.0, 3.9, 3.7],
+    "sun_disk_radiance": [80.0, 74.0, 62.0]
+  },
+  "terrain": {
+    "seed": 7,
+    "patch_resolution": 12,
+    "max_level": 16,
+    "split_sse_pixels": 64.0,
+    "merge_sse_pixels": 32.0,
+    "max_desired_patches": 180,
+    "max_gpu_patches": 256,
+    "build_budget_per_frame": 8,
+    "upload_budget_per_frame": 4,
+    "lod_changes_per_update": 8,
+    "cache_capacity": 1024
+  }
+}

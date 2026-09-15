@@ -12,6 +12,7 @@
 - 白天看到太阳、天空和云；夜晚看到经过大气消光的星空。
 - 在太空看到球形地平线、被照亮的行星表面、大气边缘和昼夜分界。
 - 地形既可由固定种子的程序噪声生成，也可由真实 DEM 数据提供。
+- 支持暂停、加速和指定时间；太阳、星空、云和天气状态随时间连续变化，形成可复现的动态场景。
 
 ## 核心技术方向
 
@@ -49,6 +50,14 @@
 - 体积云采用有界 Ray Marching、空区域跳过、提前终止与低分辨率重建。
 - 星空使用方向数据或可验证来源的星表；大气内观察时应用消光，白天由曝光和散射自然压制。
 
+### 时间、天气与扩展性
+
+- 统一时间系统只推进世界时间，不直接修改渲染器；天体、天气、云和海洋分别消费时间快照。
+- 早期静态太阳和静态天气也使用正式数据接口，后期可替换为动态生产者而不改写渲染消费者。
+- 天气系统后期负责球面天气场、云量、风和气溶胶等时变状态，但不演变为通用气象科学模拟器。
+- 植被等地表覆盖物当前不实现，但地形分块、表面语义和资源生命周期必须允许后续独立扩展。
+- 海洋后期接受太阳、大气、天空和天气风场的统一输入，建立完整水面光照，而不是孤立的颜色效果。
+
 ## 辐亮度合成关系
 
 ```text
@@ -65,16 +74,27 @@ Linear HDR → exposure → bloom → tone mapping → display
 ```
 
 具体架构和阶段验收见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+关键 Bug、根因和防回归记录见 [docs/IMPLEMENTATION_ISSUES.md](docs/IMPLEMENTATION_ISSUES.md)。
 
 ## 当前状态
 
-仓库中已有的球壳单次散射原型可以作为大气数学参考，但现有局部平面地面、固定全屏积分和相机接口不满足新目标。下一里程碑不是继续添加视觉特效，而是建立行星坐标、球面地形网格和跨高度相机闭环。
+M0、M1 与 M2 已完成：稳定入口已有 CPU 双精度行星相机、浮动原点、静态 `LightingState` 和 Taichi 自定义光栅管线。地形采用每 patch SSE 驱动的 Mixed LOD（split/merge 滞回、最高 L16、相邻层级差不超过一），并明确分离 Desired、Resident 和 Render Set。Patch 通过优先级队列、固定帧预算、父级 fallback、LRU GPU slot 渐进驻留；转动视角只改变 Render Set。程序高度、顶点和法线由 Taichi GPU kernel 生成，CPU 只传递轻量 descriptor、双精度 anchor 减 camera 后的相对坐标。当前粗细边使用只在必要边启用的 skirt，Geomorph 与真实 DEM 数据加载尚未实现。
 
-## 参考原型（非 M0 入口）
+## 运行 M0
+
+```bash
+python -m pip install -e .
+python main.py --backend auto --preview
+python main.py --backend cuda --altitude-m 2000000 --pitch-degrees -35 --output output/space.png
+```
+
+预览使用 WASD 沿局部切平面移动、空格径向上升、Shift 径向下降、按住鼠标左键拖动视角。参数面板可以跳转至地表、50 km 和 2000 km 高度，并显示径向高度、解析地平线距离和浮动原点 revision。
+
+## 参考原型（非稳定入口）
 
 仓库当前可运行代码是旧球壳单次散射参考原型，只用于核对球壳求交、Rayleigh/Mie 光学深度和 Taichi 性能。它的局部平面、相机和全屏积分管线不是新架构的稳定入口，禁止在其上继续添加地形、海洋或云功能。
 
-M0 完成前，项目没有可验收的行星渲染入口。`main.py` 只报告当前状态，不会隐式导入实验代码。参考原型必须显式运行：
+旧大气原型必须显式运行：
 
 ```bash
 python -m experiments.atmosphere_reference.cli --preset day --backend auto --preview
@@ -84,7 +104,7 @@ python -m experiments.atmosphere_reference.cli --preset day --backend auto --pre
 
 - 多行星系统与行星间切换。
 - 轨道力学、航天器动力学或天体仿真。
-- 通用游戏场景、实体组件系统、角色、植被和建筑。
+- 通用游戏场景、实体组件系统、角色和建筑；植被等覆盖物不在当前路线实现，但保留专用扩展接口。
 - 完整路径追踪器或离线电影级渲染器。
 - 板块运动、侵蚀和天气等完整科学模拟。
 
