@@ -28,6 +28,7 @@ class TerrainTileManager:
                  cache_capacity:int=1024,build_budget:int=8,upload_budget:int=4,selection_interval_s:float=.1):
         self.planet=planet; self.selector=selector; self.max_slots=max_slots; self.cache_capacity=cache_capacity
         self.build_budget=build_budget; self.upload_budget=upload_budget; self.selection_interval_s=selection_interval_s
+        self.queue_scan_budget=max(64,build_budget*8)
         self.records:dict[PatchKey,PatchRecord]={}; self.queue:list[tuple[float,int,PatchKey]]=[]; self.free_slots=list(range(max_slots-1,-1,-1))
         self.desired=frozenset(); self.resident:set[PatchKey]=set(); self.render_keys:set[PatchKey]=set()
         self.frame=0; self._version=0; self._last_selection=-1e9; self._last_position:np.ndarray|None=None; self._last_time=time.perf_counter()
@@ -174,23 +175,31 @@ class TerrainTileManager:
             fallback_bias=(self.selector.max_level-key.level)*1.0e9
             self._request(key,self._priority(key,camera,viewport_height,velocity_direction,forward)+fallback_bias)
         # 运动方向上的下一层子块作为低优先级预取，不进入 desired 集合。
+        prefetch:set[PatchKey]=set()
         if velocity_direction is not None:
             ranked=sorted(self.desired,key=lambda k:self._priority(k,camera,viewport_height,velocity_direction,forward),reverse=True)[:2]
             for key in ranked:
                 if key.level<self.selector.max_level:
                     for child in key.children():
-                        existing=self.records.get(child)
+                        prefetch.add(child);existing=self.records.get(child)
                         if existing is None or existing.state==PatchState.UNLOADED:self._request(child,self._priority(child,camera,viewport_height,velocity_direction,forward)*.25)
 
-        build_start=time.perf_counter(); built=0
-        while self.queue and built<self.build_budget:
+        active_requests=needed|prefetch
+        for record in self.records.values():
+            if record.state==PatchState.REQUESTED and record.key not in active_requests:
+                record.state=PatchState.UNLOADED;record.request_version+=1
+        if len(self.queue)>self.cache_capacity*2:self._compact_request_queue()
+
+        build_start=time.perf_counter();built=0;scanned=0
+        while self.queue and built<self.build_budget and scanned<self.queue_scan_budget:
+            scanned+=1
             _,version,key=heapq.heappop(self.queue); record=self.records.get(key)
             if record is None or record.state!=PatchState.REQUESTED or record.request_version!=version: continue
             record.state=PatchState.READY; record.last_used_frame=self.frame; built+=1
         build_ms=(time.perf_counter()-build_start)*1000
 
         upload_start=time.perf_counter(); uploaded=0
-        ready=sorted((r for r in self.records.values() if r.state==PatchState.READY),key=lambda r:r.priority,reverse=True)
+        ready=sorted((r for r in self.records.values() if r.state==PatchState.READY and r.key in active_requests),key=lambda r:r.priority,reverse=True)
         for record in ready:
             if uploaded>=self.upload_budget: break
             if not self.free_slots and not self._evict_one(renderer,needed): break
@@ -208,9 +217,6 @@ class TerrainTileManager:
             self._balance_render_coverage(coverage)
             self._balanced_input=balance_input;self._balanced_output=frozenset(coverage)
         coverage_signature=frozenset(coverage)
-        if coverage_signature!=self._boundary_signature:
-            self._boundary_cache={key:self.selector.boundary_masks(key,coverage) for key in coverage}
-            self._boundary_signature=coverage_signature
         position_key=tuple(float(value) for value in camera.position_global)
         visibility_signature=(coverage_signature,position_key,camera.yaw_degrees,camera.pitch_degrees,camera.vertical_fov_degrees,renderer.width,renderer.height)
         if visibility_signature!=self._visibility_signature:
@@ -218,6 +224,10 @@ class TerrainTileManager:
             self._visible_cache={key for key in coverage if self._visible(key,visibility_context)}
             self._visibility_signature=visibility_signature
         visible=set(self._visible_cache)
+        visible_signature=frozenset(visible)
+        if visible_signature!=self._boundary_signature:
+            self._boundary_cache={key:self.selector.boundary_masks(key,visible) for key in visible}
+            self._boundary_signature=visible_signature
         descriptors=[]
         for key in visible:
             record=self.records[key]; record.last_used_frame=self.frame
@@ -359,3 +369,8 @@ class TerrainTileManager:
         if excess<=0:return
         candidates=sorted((r for r in self.records.values() if r.key not in needed and r.state!=PatchState.GPU_RESIDENT),key=lambda r:r.last_used_frame)
         for record in candidates[:excess]: self.records.pop(record.key,None)
+        if len(self.queue)>self.cache_capacity*2:self._compact_request_queue()
+
+    def _compact_request_queue(self)->None:
+        self.queue=[(-record.priority,record.request_version,record.key) for record in self.records.values() if record.state==PatchState.REQUESTED]
+        heapq.heapify(self.queue)

@@ -1,5 +1,6 @@
 import numpy as np
 import taichi as ti
+import time
 
 from planet_renderer.camera import PlanetCamera
 from planet_renderer.planet import PlanetModel
@@ -88,6 +89,31 @@ def test_mixed_lod_is_incremental_and_reaches_high_local_levels():
             if neighbor is not None: assert abs(key.level-neighbor.level)<=1
 
 
+def test_high_speed_cross_scale_streaming_remains_bounded():
+    planet=PlanetModel(6_360_000.0)
+    camera=_camera(planet,2_000_000.0)
+    settings=TerrainSettings(patch_resolution=3,max_level=12,max_desired_patches=60,max_gpu_patches=64,build_budget_per_frame=4,upload_budget_per_frame=2,lod_changes_per_update=6,cache_capacity=128,selection_interval_s=.01)
+    terrain=CubeSphereTerrain(planet,ProceduralHeightSource(seed=11),settings)
+    class RendererStub:
+        width=320;height=180
+        def upload_patch(self,slot,descriptor):pass
+        def release_patch(self,slot):pass
+        def set_render_patches(self,descriptors,slots):pass
+    renderer=RendererStub();now=1.0;started=time.perf_counter()
+    for frame in range(180):
+        now+=.02
+        if frame<80:camera.move_local(planet,0.0,-24_000.0,0.0)
+        else:camera.move_local(planet,18_000.0,0.0,9_000.0)
+        terrain.update(camera,180,renderer,now=now)
+        assert len(terrain.tile_manager.queue)<=settings.cache_capacity*2
+        leaves=set(terrain.selector.leaves)
+        for key in leaves:
+            for edge in range(4):
+                neighbor=terrain.selector._neighbor(leaves,key,edge)
+                if neighbor is not None:assert abs(key.level-neighbor.level)<=1
+    assert time.perf_counter()-started<15.0
+
+
 def test_small_cpu_render_has_finite_gbuffer():
     ti.init(arch=ti.cpu, offline_cache=False)
     planet = PlanetModel(6_360_000.0)
@@ -100,6 +126,11 @@ def test_small_cpu_render_has_finite_gbuffer():
     terrain.update(camera, 48, renderer, now=1.0)
     light = LightingState(np.array([0.2, 0.8, 0.4]), 0.266, (4.0, 3.9, 3.7), (80.0, 74.0, 62.0))
     renderer.render(planet, camera, light, (0.16, 0.2, 0.12), 0.0)
+    valid=renderer.valid.to_numpy()!=0
+    projected=renderer.screen.to_numpy()[valid,:,:2]
+    assert np.isfinite(projected).all()
+    assert projected[:,:,0].min()>=-1.0/256.0 and projected[:,:,0].max()<=renderer.width+1.0/256.0
+    assert projected[:,:,1].min()>=-1.0/256.0 and projected[:,:,1].max()<=renderer.height+1.0/256.0
     render_key = next(iter(renderer._render_slots))
     slot = renderer._render_slots[render_key]
     center_direction = cube_face_direction(render_key.face,
@@ -108,6 +139,7 @@ def test_small_cpu_render_has_finite_gbuffer():
     gpu_center_height = float(renderer.height_m.to_numpy()[slot, 4])
     assert abs(gpu_center_height - terrain.height_provider.sample_height_m(center_direction)) < 80.0
     assert np.isfinite(renderer.hdr_numpy()).all()
+    assert int(renderer.tile_overflow[None])==0
     weld_count=int(renderer.weld_count[None])
     assert weld_count>0
     weld_dst=renderer.weld_dst.to_numpy()[:weld_count]

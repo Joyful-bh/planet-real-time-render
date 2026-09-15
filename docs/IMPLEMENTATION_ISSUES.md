@@ -219,6 +219,8 @@ RTX 3050 Laptop GPU、1280×720 的用户基线显示：平均帧时间 185.7 ms
 
 已增加 `tools/profile_m2.py`，分别测量 stable/move 的 CPU dispatch、同步完成的 Patch GPU 工作、Render GPU 工作、P50/P95/P99、Patch/三角形数量、Tile 候选分布、Python call site 和 Taichi kernel 明细。已实施：跳过已请求/驻留 Patch 的 Priority 重算、每帧复用相机裁剪上下文、Desired 祖先缓存、批量 Coverage 平衡、整数 Cube Grid 边界键、Coverage 边界 Mask 缓存、静止相机可见集缓存，以及 Render Set 未变化时跳过 GPU 状态重传。短基准在仍处于 LOD 收敛的情况下由 185.7 ms 降至约 39.2 ms；仍需用户使用完整 stable/move 命令复测。
 
+完成缓存与 BUG-0008 五平面裁剪后，本机 RTX 3050 Laptop GPU、1280×720、78 Render Patch、29,952 个三角形的完全收敛 stable 诊断为平均 15.07 ms（约 66.4 FPS），P95 16.40 ms，Tile overflow 为零；其中 Terrain CPU dispatch 4.57 ms，完整五平面裁剪 GPU kernel 约 0.29 ms。移动场景仍需用户复测，因此本问题保持 open。
+
 ### 验证
 
 使用相同 CUDA 设备、配置、分辨率、seed、相机路径和预热帧数保存前后 JSON。首次 JIT 单独排除；`tile_overflow` 必须为零。最终以 Preview 稳定 FPS 和移动 P95/P99 卡顿共同验收。
@@ -230,3 +232,66 @@ RTX 3050 Laptop GPU、1280×720 的用户基线显示：平均帧时间 185.7 ms
 ### 剩余限制
 
 当前只有极小 CPU 烟雾结果，不能据此推断目标 CUDA 后端瓶颈或宣称性能改善；需要在用户实际 GPU 上采集基线。
+
+## BUG-0008：高空粗 LOD 三角形产生内部锯齿状黑色缺口
+
+- 状态：`fixed`
+- 所属阶段：M2 自定义光栅与 Mixed LOD
+- 发现条件：约 85 km 高度、LOD 1–3，视线掠过由大尺度三角形覆盖的地表。
+- 现象：Patch 内部出现由长对角线和阶梯边组成的大面积背景缺口；部分最终 Render Patch 边界仍出现细黑缝。
+
+### 根因
+
+旧裁剪器只处理 `z >= 0.1 m` 近面，不处理左右和上下视锥面。跨越相机平面的数十公里级粗 LOD 三角形会在 `z=0.1` 处产生远离视锥的交点，透视除法后屏幕坐标可达数亿像素；float32 边函数发生严重消减并错误判断大片像素覆盖。该形状位于 Patch 内部，因此不是 Horizon/Frustum Patch Culling。参考拓扑全部保持向外绕序，且当前观察变换为反手基底，`front_facing < 0` 符号经验证正确。细缝的附加原因是边界 Mask 根据裁剪前 Coverage 而非最终 Visible Set 计算。
+
+### 修复
+
+- 使用固定容量 Sutherland–Hodgman 多边形裁剪依次处理 near、left、right、bottom、top 五个观察空间平面。
+- 最多保留八个裁剪多边形顶点并扇形输出六个三角形；所有位置、法线、材质、高度和 Cell ID 同步插值。
+- 仅对完整裁剪后的有限视锥内顶点执行透视除法，避免超大屏幕坐标进入边函数。
+- 固定小循环使用运行时上限，避免多层 `ti.static` 导致 JIT IR 爆炸。
+- Stitch/Skirt Mask 改为依据最终 Visible Render Set 计算。
+
+### 验证
+
+CPU 实际光栅测试要求所有有效裁剪顶点有限且投影坐标位于视口边界的 1/256 像素容差内，G-buffer 有命中、HDR 有限且 Tile overflow 为零。高空实际画面由用户复测。
+
+### 防回归措施
+
+不得在未裁侧平面的情况下把 near 降至行星尺度三角形不适用的极小值；修改裁剪容量、平面符号、FOV 参数化或投影公式时必须运行投影范围测试。背面剔除符号必须结合坐标基底手性验证，不能通过截图直接翻转。
+
+### 剩余限制
+
+当前没有 far plane；行星地表由 Horizon Culling 控制远端范围。六倍最坏裁剪输出容量增加显存和 `_bin` 扫描上限，后续应配合紧凑 Active Triangle 列表优化，但不得退回不完整裁剪。
+
+## BUG-0009：高速跨尺度移动后 Preview 主线程永久卡死
+
+- 状态：`fixed`
+- 所属阶段：M2 LOD Selector 与 Patch Streaming
+- 发现条件：启动后跳转至 2000 km，以较大速度下降，并在中低高度持续横向移动。
+- 现象：运行一段时间后窗口、FPS 标题和输入同时停止刷新。卡死前常见 GPU Resident 达到 256，历史 READY Patch 大量积累。
+
+### 根因
+
+Selector 的邻接平衡在 Patch 容量边界同时允许“拆粗侧”和“并细侧”，使用无迭代上限的 `while changed`；特定 Mixed LOD 拓扑下可能在两种状态间振荡。Streaming 请求堆的预算只统计有效 Build，不统计失效 heap entry，跨越大量区域后单帧可能无上限清理旧条目。历史 REQUESTED/READY Patch 没有与当前 Needed/Prefetch 集合解绑，所有 READY 又都可参与上传，导致 Slot 满载后继续无效换入换出并放大堆积。
+
+### 修复
+
+- 邻接平衡改为只粗化细侧的单调过程，最多执行 `max_level + 1` 轮；若违反数学收敛条件则明确抛错，不再永久占用 UI 线程。
+- `last_changes` 根据最终叶集合是否实际变化计算，避免被撤销的 Split 让 Selector 永久自触发。
+- 每帧 heap 扫描同时受有效 Build Budget 和总 Scan Budget 限制。
+- heap 超过固定阈值时只保留当前版本的 REQUESTED 记录并重新 heapify。
+- 当前 Needed/Prefetch 之外的 REQUESTED 会取消；READY 只有重新进入当前 Needed/Prefetch 才允许上传。
+- 历史 READY 继续作为有容量上限的 CPU Cache，不再抢占 GPU Slot。
+
+### 验证
+
+新增无窗口跨尺度压力测试：从 2000 km 连续执行 80 次 24 km 下降，再执行 100 次约 20 km 横移；每帧检查请求堆容量和相邻 LOD 差，整段必须在固定时间预算内完成。完整 CPU/GPU 光栅测试继续验证 G-buffer、裁剪和 Tile overflow。
+
+### 防回归措施
+
+任何 `while` 驱动的 LOD 拓扑修正都必须证明单调量或设置硬上限。异步队列预算必须统计扫描工作而不只统计成功结果；缓存记录、请求堆和 GPU Residency 必须分别设置容量和准入条件。
+
+### 剩余限制
+
+单调粗化可能在 Patch 容量不足时牺牲细节范围，但保持无裂缝和有限完成时间。后续可在 Split 前预估完整一环邻居成本，以减少一次选择中被平衡器撤销的细分。

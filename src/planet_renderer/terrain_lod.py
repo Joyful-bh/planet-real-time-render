@@ -60,7 +60,7 @@ class MixedLodSelector:
         return geometric_error*focal/distance
 
     def select(self,camera:PlanetCamera,viewport_height:int)->frozenset[PatchKey]:
-        started=time.perf_counter();leaves=set(self.leaves);changes=0
+        started=time.perf_counter();previous=self.leaves;leaves=set(previous);changes=0
         parents={key.parent() for key in leaves if key.level>0};merge=[]
         for parent in parents:
             if parent is not None and all(child in leaves for child in parent.children()):
@@ -74,7 +74,7 @@ class MixedLodSelector:
             if changes>=self.max_changes or error<=self.split_sse or len(leaves)+3>self.max_leaves:break
             if key in leaves:leaves.remove(key);leaves.update(key.children());changes+=1
         self._balance_neighbors(leaves,camera,viewport_height)
-        self.leaves=frozenset(leaves);self.last_changes=changes;self.last_ms=(time.perf_counter()-started)*1000
+        self.leaves=frozenset(leaves);self.last_changes=0 if self.leaves==previous else max(changes,1);self.last_ms=(time.perf_counter()-started)*1000
         return self.leaves
 
     def _leaf_at(self,leaves:set[PatchKey],direction:Vec3d)->PatchKey|None:
@@ -90,21 +90,26 @@ class MixedLodSelector:
         return self._leaf_at(leaves,cube_face_vector(key.face,*uv))
 
     def _balance_neighbors(self,leaves:set[PatchKey],camera:PlanetCamera,viewport_height:int)->None:
-        changed=True
-        while changed:
-            changed=False
+        # Balance is deliberately monotonic: only coarsen the fine side.  The
+        # former split-or-coarsen loop could oscillate forever at max_leaves.
+        # SSE selection can refine the area again on later updates when the
+        # complete one-level neighborhood fits the budget.
+        for _ in range(self.max_level+1):
+            replacements:set[PatchKey]=set()
             for key in tuple(leaves):
                 for edge in range(4):
                     neighbor=self._neighbor(leaves,key,edge)
                     if neighbor is not None and key.level-neighbor.level>1:
-                        if len(leaves)+3<=self.max_leaves:
-                            leaves.remove(neighbor);leaves.update(neighbor.children())
-                        else:
-                            parent=key.parent()
-                            if parent is None:continue
-                            leaves.difference_update(leaf for leaf in tuple(leaves) if parent.is_ancestor_of(leaf));leaves.add(parent)
-                        changed=True;break
-                if changed: break
+                        parent=key.parent()
+                        if parent is not None:replacements.add(parent)
+                        break
+            if not replacements:return
+            selected:set[PatchKey]=set()
+            for parent in sorted(replacements,key=lambda value:value.level):
+                if not any(existing.is_ancestor_of(parent) for existing in selected):selected.add(parent)
+            for parent in selected:
+                leaves.difference_update(leaf for leaf in tuple(leaves) if parent.is_ancestor_of(leaf));leaves.add(parent)
+        raise RuntimeError("LOD neighbor balancing did not converge within max_level")
 
     def stitch_mask(
         self, key: PatchKey, render_keys: set[PatchKey],

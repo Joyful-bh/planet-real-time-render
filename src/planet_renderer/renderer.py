@@ -11,7 +11,7 @@ from .postprocess import display_transform
 from .terrain_lod import cube_face_direction
 from .terrain_types import PatchDescriptor,PatchKey
 
-TILE_SIZE=16; MAX_TRIANGLES_PER_TILE=512
+TILE_SIZE=16;MAX_TRIANGLES_PER_TILE=512;MAX_CLIP_VERTICES=8;MAX_CLIPPED_TRIANGLES=6
 
 @dataclass(frozen=True)
 class TimingResult: jit_seconds:float; average_seconds:float; frames_per_second:float
@@ -72,7 +72,7 @@ class PlanetRenderer:
         self.stitch_count=ti.field(ti.i32,shape=())
         self.stitch_vertex=ti.Vector.field(4,ti.i32,shape=self.max_stitch_operations)
         self.anchor_relative=ti.Vector.field(3,ti.f32,shape=max_patches);self.offset=ti.Vector.field(3,ti.f32,shape=(max_patches,self.vertices_per_patch));self.normal=ti.Vector.field(3,ti.f32,shape=(max_patches,self.vertices_per_patch));self.height_m=ti.field(ti.f32,shape=(max_patches,self.vertices_per_patch));self.material=ti.Vector.field(4,ti.f32,shape=(max_patches,self.vertices_per_patch));self.cell=ti.field(ti.i32,shape=(max_patches,self.vertices_per_patch));self.view=ti.Vector.field(3,ti.f32,shape=(max_patches,self.vertices_per_patch))
-        raster_capacity=max_patches*self.local_triangle_count*2;rs=(raster_capacity,3)
+        raster_capacity=max_patches*self.local_triangle_count*MAX_CLIPPED_TRIANGLES;rs=(raster_capacity,3)
         self.rv=ti.Vector.field(3,ti.f32,shape=rs);self.rn=ti.Vector.field(3,ti.f32,shape=rs);self.rm=ti.Vector.field(4,ti.f32,shape=rs);self.rh=ti.field(ti.f32,shape=rs);self.rc=ti.field(ti.i32,shape=rs);self.screen=ti.Vector.field(3,ti.f32,shape=rs);self.source=ti.field(ti.i32,shape=raster_capacity);self.valid=ti.field(ti.i32,shape=raster_capacity)
         self.tile_counts=ti.field(ti.i32,shape=(self.tiles_x,self.tiles_y));self.tile_triangles=ti.field(ti.i32,shape=(self.tiles_x,self.tiles_y,MAX_TRIANGLES_PER_TILE));self.tile_overflow=ti.field(ti.i32,shape=())
         shape=(width,height);self.depth=ti.field(ti.f32,shape=shape);self.gbuffer_position=ti.Vector.field(3,ti.f32,shape=shape);self.gbuffer_normal=ti.Vector.field(3,ti.f32,shape=shape);self.gbuffer_albedo=ti.Vector.field(3,ti.f32,shape=shape);self.gbuffer_material_weights=ti.Vector.field(4,ti.f32,shape=shape);self.gbuffer_height_m=ti.field(ti.f32,shape=shape);self.gbuffer_surface_id=ti.field(ti.i32,shape=shape);self.gbuffer_surface_cell_id=ti.field(ti.i32,shape=shape);self.hdr=ti.Vector.field(3,ti.f32,shape=shape);self.display=ti.Vector.field(3,ti.f32,shape=shape)
@@ -304,26 +304,46 @@ class PlanetRenderer:
             self.screen[s,k]=ti.Vector([projected.x,projected.y,p.z])
         self.source[s]=src;self.valid[s]=1
     @ti.func
-    def _cut(self,a:ti.template(),b:ti.template(),an:ti.template(),bn:ti.template(),am:ti.template(),bm:ti.template(),ah:ti.f32,bh:ti.f32,near:ti.f32):
-        t=(near-a.z)/(b.z-a.z);return a+(b-a)*t,(an+(bn-an)*t).normalized(),am+(bm-am)*t,ah+(bh-ah)*t
+    def _clip_distance(self,p:ti.template(),plane:ti.i32,near:ti.f32,tan_x:ti.f32,tan_y:ti.f32)->ti.f32:
+        distance=p.z-near
+        if plane==1:distance=p.x+p.z*tan_x
+        elif plane==2:distance=-p.x+p.z*tan_x
+        elif plane==3:distance=p.y+p.z*tan_y
+        elif plane==4:distance=-p.y+p.z*tan_y
+        return distance
     @ti.kernel
     def _clip(self,near:ti.f32,tf:ti.f32):
+        aspect=ti.cast(self.width,ti.f32)/self.height;tan_x=tf*aspect;tan_y=tf
         for source_id in range(self.max_patches*self.local_triangle_count):
-            slot=source_id//self.local_triangle_count;local_id=source_id%self.local_triangle_count;s=source_id*2;self.valid[s]=0;self.valid[s+1]=0
+            slot=source_id//self.local_triangle_count;local_id=source_id%self.local_triangle_count;s=source_id*MAX_CLIPPED_TRIANGLES
+            for output in range(MAX_CLIPPED_TRIANGLES):self.valid[s+output]=0
             skirt_edge=(local_id-self.surface_triangle_count)//(self.resolution*2)
             enabled=local_id<self.surface_triangle_count or (skirt_edge>=0 and (self.slot_skirt_mask[slot]&(1<<skirt_edge))!=0)
             if self.slot_render[slot] and enabled:
-                ids=self.local_triangles[local_id];v=ti.Matrix.rows([self.view[slot,ids.x],self.view[slot,ids.y],self.view[slot,ids.z]]);n=ti.Matrix.rows([self.normal[slot,ids.x],self.normal[slot,ids.y],self.normal[slot,ids.z]]);m=ti.Matrix.rows([self.material[slot,ids.x],self.material[slot,ids.y],self.material[slot,ids.z]]);h=ti.Vector([self.height_m[slot,ids.x],self.height_m[slot,ids.y],self.height_m[slot,ids.z]]);c=ti.Vector([self.cell[slot,ids.x],self.cell[slot,ids.y],self.cell[slot,ids.z]]);inside=ti.Vector([v[0,2]>=near,v[1,2]>=near,v[2,2]>=near]);count=ti.cast(inside[0],ti.i32)+ti.cast(inside[1],ti.i32)+ti.cast(inside[2],ti.i32)
-                if count==3:self._emit(s,source_id,v,n,m,h,c,tf)
-                elif count==1:
-                    a=0
-                    if inside[1]:a=1
-                    elif inside[2]:a=2
-                    b=(a+1)%3;d=(a+2)%3;vb,nb,mb,hb=self._cut(v[a,:],v[b,:],n[a,:],n[b,:],m[a,:],m[b,:],h[a],h[b],near);vd,nd,md,hd=self._cut(v[a,:],v[d,:],n[a,:],n[d,:],m[a,:],m[d,:],h[a],h[d],near);self._emit(s,source_id,ti.Matrix.rows([v[a,:],vb,vd]),ti.Matrix.rows([n[a,:],nb,nd]),ti.Matrix.rows([m[a,:],mb,md]),ti.Vector([h[a],hb,hd]),ti.Vector([c[a],c[a],c[a]]),tf)
-                elif count==2:
-                    d=0
-                    if inside[0]:d=2 if inside[1] else 1
-                    a=(d+1)%3;b=(d+2)%3;va,na,ma,ha=self._cut(v[a,:],v[d,:],n[a,:],n[d,:],m[a,:],m[d,:],h[a],h[d],near);vb,nb,mb,hb=self._cut(v[b,:],v[d,:],n[b,:],n[d,:],m[b,:],m[d,:],h[b],h[d],near);self._emit(s,source_id,ti.Matrix.rows([v[a,:],v[b,:],vb]),ti.Matrix.rows([n[a,:],n[b,:],nb]),ti.Matrix.rows([m[a,:],m[b,:],mb]),ti.Vector([h[a],h[b],hb]),ti.Vector([c[a],c[b],c[b]]),tf);self._emit(s+1,source_id,ti.Matrix.rows([v[a,:],vb,va]),ti.Matrix.rows([n[a,:],nb,na]),ti.Matrix.rows([m[a,:],mb,ma]),ti.Vector([h[a],hb,ha]),ti.Vector([c[a],c[b],c[a]]),tf)
+                ids=self.local_triangles[local_id]
+                positions=ti.Matrix.zero(ti.f32,MAX_CLIP_VERTICES*2,3);normals=ti.Matrix.zero(ti.f32,MAX_CLIP_VERTICES*2,3);materials=ti.Matrix.zero(ti.f32,MAX_CLIP_VERTICES*2,4);heights=ti.Vector.zero(ti.f32,MAX_CLIP_VERTICES*2);cells=ti.Vector.zero(ti.i32,MAX_CLIP_VERTICES*2)
+                for vertex in range(3):
+                    index=ids[vertex];positions[vertex,:]=self.view[slot,index];normals[vertex,:]=self.normal[slot,index];materials[vertex,:]=self.material[slot,index];heights[vertex]=self.height_m[slot,index];cells[vertex]=self.cell[slot,index]
+                count=3;read_buffer=0
+                for plane in range(5):
+                    write_buffer=1-read_buffer;output_count=0
+                    for vertex in range(MAX_CLIP_VERTICES):
+                        if vertex<count:
+                            previous=(vertex+count-1)%count;current_index=read_buffer*MAX_CLIP_VERTICES+vertex;previous_index=read_buffer*MAX_CLIP_VERTICES+previous
+                            current_position=positions[current_index,:];previous_position=positions[previous_index,:]
+                            current_distance=self._clip_distance(current_position,plane,near,tan_x,tan_y);previous_distance=self._clip_distance(previous_position,plane,near,tan_x,tan_y)
+                            current_inside=current_distance>=0.;previous_inside=previous_distance>=0.
+                            if current_inside!=previous_inside and output_count<MAX_CLIP_VERTICES:
+                                denominator=previous_distance-current_distance;t=previous_distance/denominator if ti.abs(denominator)>1e-20 else 0.
+                                destination=write_buffer*MAX_CLIP_VERTICES+output_count
+                                positions[destination,:]=previous_position+(current_position-previous_position)*t;normals[destination,:]=(normals[previous_index,:]+(normals[current_index,:]-normals[previous_index,:])*t).normalized();materials[destination,:]=materials[previous_index,:]+(materials[current_index,:]-materials[previous_index,:])*t;heights[destination]=heights[previous_index]+(heights[current_index]-heights[previous_index])*t;cells[destination]=cells[current_index] if current_inside else cells[previous_index];output_count+=1
+                            if current_inside and output_count<MAX_CLIP_VERTICES:
+                                destination=write_buffer*MAX_CLIP_VERTICES+output_count;positions[destination,:]=current_position;normals[destination,:]=normals[current_index,:];materials[destination,:]=materials[current_index,:];heights[destination]=heights[current_index];cells[destination]=cells[current_index];output_count+=1
+                    count=output_count;read_buffer=write_buffer
+                for triangle in range(MAX_CLIPPED_TRIANGLES):
+                    if triangle<count-2:
+                        a=read_buffer*MAX_CLIP_VERTICES;b=a+triangle+1;c=a+triangle+2
+                        self._emit(s+triangle,source_id,ti.Matrix.rows([positions[a,:],positions[b,:],positions[c,:]]),ti.Matrix.rows([normals[a,:],normals[b,:],normals[c,:]]),ti.Matrix.rows([materials[a,:],materials[b,:],materials[c,:]]),ti.Vector([heights[a],heights[b],heights[c]]),ti.Vector([cells[a],cells[b],cells[c]]),tf)
     @ti.kernel
     def _bin(self):
         for q in self.valid:
