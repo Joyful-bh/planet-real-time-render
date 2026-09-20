@@ -968,3 +968,56 @@ instead of retaining the diagnostic 48-step global march.
 Source compilation and a focused CPU kernel smoke test cover the new control,
 shadow-root feature calculation and finite output. Final CUDA visual acceptance
 at an Earth-scale space terminator remains user-run.
+
+## ISSUE-0023: Near-ground atmosphere lost altitude precision and disagreed on ground hits
+
+- Status: `fixed in code; visual acceptance pending`
+- Phase: M3 spherical geometry / Sky-View composition
+- Symptom: Earth-radius views showed horizontal dawn/dusk color layers, a
+  black sea-level horizon edge, and at roughly 0.5 m altitude repeated broken
+  black rings and speckles. The rings were already present in `Camera T`, so
+  they preceded radiance integration and display mapping.
+- Root cause: view-dependent kernels received `camera_radius` as f32. Around
+  6.36 million metres its ULP is approximately 0.5 m, so adding sub-metre
+  clearance to the radius destroyed the altitude before any integration began.
+  Several paths then evaluated `radius^2 - bottom_radius^2` or an equivalent
+  discriminant, magnifying cancellation at grazing incidence. Finally,
+  atmosphere interval construction and Transmittance-LUT sampling made
+  independent ground-hit decisions; one disagreement was converted into an
+  exact black transmittance sample.
+
+### Fix
+
+CPU code now subtracts the two float64 radii once and passes camera altitude as
+an independent f32 scalar. GPU shell clearance and horizon coordinates use
+`h(2R+h)`. Camera rays use a cancellation-resistant quadratic and produce one
+authoritative interval/ground result; Camera-T and Sky-view no longer recover
+height from an Earth-scale radius or repeat the unstable squared-radius test.
+Transmittance-LUT coordinates likewise use altitude and factored shell height.
+Surface lighting and camera-to-surface reconstruction derive endpoint altitude
+from a stable radial-delta expression.
+
+The low-resolution Sky-View cache remains appropriate for smooth regions, but
+is not sampled as the final authority around the projected horizon. A narrow
+smooth band now uses per-pixel altitude-warped integration with local
+terminator refinement. New controls are `sky_horizon_direct_steps` and
+`sky_horizon_direct_width_cosine`; the Earth preset spends the higher count
+only in that band.
+
+### Verification
+
+Configuration parsing and source compilation pass. The focused 64x48
+Earth-radius CPU render regression JIT-compiles both raster paths and every
+atmosphere diagnostic, checks finite/bounded outputs, exercises live/frozen LUT
+updates and passes. Interactive CUDA checks at 0.1-10 m altitude and the
+reported dawn/dusk views remain user-run.
+
+### Remaining limitation
+
+The solar-shadow-cylinder feature locator still operates on planet-centred f32
+vectors. It is used only to allocate extra quadrature, not to make the physical
+visibility decision, and the new stable interval prevents it from creating
+black Camera-T samples. If CUDA visual acceptance finds only a residual smooth
+terminator bias, that locator should next receive an altitude-relative form;
+it must not be addressed by restoring duplicated ground tests or full-screen
+high-count marching.

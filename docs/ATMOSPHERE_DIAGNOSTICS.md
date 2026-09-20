@@ -11,6 +11,10 @@ LUTs with a different algorithm.
   view.  Opaque geometry is intentionally ignored so the LUT can be inspected
   behind the terrain silhouette.
 - `Atmo: Camera T`: RGB transmittance from the camera along each view ray.
+  Camera altitude is represented independently from the planet radius and a
+  single stable shell interval supplies the ground-hit decision. Isolated
+  black pixels or repeated black arcs in the sky are therefore correctness
+  failures, not expected integration noise.
 - `Atmo: Transmittance LUT`: raw 2D texture.  Horizontal position reconstructs
   path distance to the atmosphere top; vertical position is normalized radial
   distance from the planet-radius cylinder. Ground-blocked rays are rejected
@@ -85,3 +89,13 @@ integrator keeps a modest altitude-warped base count and locally uses
 `aerial_horizon_raymarch_steps` globally is useful only as an isolation test:
 blocks becoming smaller without disappearing identifies deterministic
 quadrature aliasing and is not the production fix.
+
+### Near-ground black arcs and dawn/dusk sky bands
+
+Use altitudes `0.1, 0.25, 0.5, 1, 2, 5, 10` metres with fixed yaw/pitch. In
+`Atmo: Camera T`, the sky side of the analytic horizon must contain no isolated
+zeros and the boundary must move monotonically. The final composite uses a
+direct integration band around that horizon while `Atmo: Sky-view` deliberately
+continues to display the raw cache. A band visible only in raw Sky-view but not
+Composite demonstrates that the high-frequency fallback is working; a band in
+both indicates an integration/source problem rather than LUT interpolation.

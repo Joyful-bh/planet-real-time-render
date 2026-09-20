@@ -319,7 +319,7 @@ the former fixed ambient term is gone. Debug material/LOD/Patch modes remain
 unlit so diagnostic colors are not hidden by atmospheric conditions.
 
 Transmittance and Multi-Scattering LUTs rebuild only when their static inputs
-change, Sky-View rebuilds after any camera-radius or local-solar change visible
+change, Sky-View rebuilds after any camera-altitude or local-solar change visible
 to the f32 GPU kernels, and the scattering-only Aerial-Perspective volume
 rebuilds every view frame. Path integration uses variable-width intervals
 concentrated around the minimum-altitude point. Direct sunlight uses finite-disk visibility at the
@@ -330,3 +330,24 @@ requiring the expensive count everywhere. Dynamic
 weather/aerosol corrections remain later M3 work and must invalidate these
 resources through the same ownership path rather than add a second sky
 implementation.
+
+Earth-scale atmosphere geometry never recovers a small altitude by subtracting
+two f32 radii. CPU code computes `camera_altitude = camera_radius -
+planet_radius` in float64 and passes that independent scalar to the GPU. Shell
+clearance uses the factored identity `r^2 - R^2 = h(2R+h)`, horizon mapping is
+derived from the same clearance, and one stable interval result owns the
+ground-hit decision for a camera ray. Transmittance lookup consumes that
+decision and must not perform a second squared-radius test. This contract is
+what permits centimetre/metre camera clearance around an Earth-radius planet;
+changing metres to kilometres alone would not recover the lost relative f32
+precision.
+
+Sky-View remains the low-frequency cache for the common background path. Its
+angular interpolation is not authoritative in the narrow horizon band, where
+optical depth and the dawn/dusk shadow source have screen-frequency gradients.
+That band smoothly blends to bounded per-pixel integration using the same
+altitude-stable interval and terminator refinement as surface aerial
+perspective. `sky_horizon_direct_width_cosine` controls only the blend width;
+`sky_horizon_direct_steps` controls its base quadrature. Increasing global LUT
+resolution or relying on temporal filtering is not a substitute for this
+high-frequency path.

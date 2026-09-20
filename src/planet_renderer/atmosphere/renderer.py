@@ -217,6 +217,120 @@ class AtmosphereRenderer:
         return near, far, hit
 
     @ti.func
+    def _shell_rho(self, altitude, bottom_radius):
+        """Return ``sqrt((R+h)^2-R^2)`` without subtracting large squares."""
+
+        safe_altitude = ti.max(altitude, 0.0)
+        return ti.sqrt(
+            safe_altitude * (2.0 * bottom_radius + safe_altitude)
+        )
+
+    @ti.func
+    def _altitude_on_ray(
+        self,
+        origin_altitude,
+        origin_ray_cosine,
+        distance,
+        bottom_radius,
+    ):
+        """Evaluate radial altitude while preserving sub-metre clearance.
+
+        Expanding ``|p+t*d|^2-R^2`` around the reference sphere keeps the
+        small altitude term independent from the Earth-scale radius.  The
+        final subtraction is rationalized for the same reason.
+        """
+
+        altitude = ti.max(origin_altitude, 0.0)
+        origin_radius = bottom_radius + altitude
+        radial_delta = (
+            altitude * (2.0 * bottom_radius + altitude)
+            + 2.0 * origin_radius * origin_ray_cosine * distance
+            + distance * distance
+        )
+        radial_length = ti.sqrt(
+            ti.max(bottom_radius * bottom_radius + radial_delta, 0.0)
+        )
+        return radial_delta / ti.max(radial_length + bottom_radius, 1.0)
+
+    @ti.func
+    def _shell_roots_from_altitude(
+        self,
+        origin_altitude,
+        ray_cosine,
+        shell_altitude,
+        bottom_radius,
+    ):
+        """Stable roots for a ray starting on the local radial axis.
+
+        ``c`` is factored as ``(h-H)(2R+h+H)`` and the quadratic roots use
+        the cancellation-resistant ``q`` formulation.  This is the canonical
+        atmosphere boundary test for camera/view rays.
+        """
+
+        origin_radius = bottom_radius + origin_altitude
+        half_linear = origin_radius * ray_cosine
+        constant = (origin_altitude - shell_altitude) * (
+            2.0 * bottom_radius + origin_altitude + shell_altitude
+        )
+        discriminant = half_linear * half_linear - constant
+        hit = discriminant >= 0.0
+        near = ti.cast(_LARGE_DISTANCE, ti.f32)
+        far = -ti.cast(_LARGE_DISTANCE, ti.f32)
+        if hit:
+            root = ti.sqrt(ti.max(discriminant, 0.0))
+            sign = 1.0
+            if half_linear < 0.0:
+                sign = -1.0
+            q = -half_linear - sign * root
+            root0 = -half_linear - root
+            root1 = -half_linear + root
+            if ti.abs(q) > 1.0e-12:
+                root0 = q
+                root1 = constant / q
+            near = ti.min(root0, root1)
+            far = ti.max(root0, root1)
+        return near, far, hit
+
+    @ti.func
+    def _atmosphere_segment_from_altitude(
+        self,
+        camera_altitude,
+        ray_cosine,
+        bottom_radius,
+    ):
+        """Build the single authoritative interval for a camera ray."""
+
+        top_altitude = ti.static(self.config.top_altitude_m)
+        outer_near, outer_far, outer_hit = self._shell_roots_from_altitude(
+            camera_altitude,
+            ray_cosine,
+            top_altitude,
+            bottom_radius,
+        )
+        start = ti.max(outer_near, 0.0)
+        end = outer_far
+        valid = outer_hit and end > start
+        ends_at_ground = False
+        ground_near, ground_far, ground_hit = self._shell_roots_from_altitude(
+            camera_altitude,
+            ray_cosine,
+            0.0,
+            bottom_radius,
+        )
+        if valid and ground_hit:
+            ground_distance = ti.cast(_LARGE_DISTANCE, ti.f32)
+            # The epsilon lives in ray-distance space and is never added to R.
+            boundary_epsilon = 1.0e-3
+            if ground_near > start + boundary_epsilon:
+                ground_distance = ground_near
+            elif ground_far > start + boundary_epsilon:
+                ground_distance = ground_far
+            if ground_distance < end:
+                end = ground_distance
+                ends_at_ground = True
+        return start, end, valid, ends_at_ground
+
+    @ti.func
     def _atmosphere_segment(
         self,
         origin: ti.template(),
@@ -251,50 +365,34 @@ class AtmosphereRenderer:
         return start, end, valid, ends_at_ground
 
     @ti.func
-    def _aerial_prefix_segment(
+    def _aerial_prefix_segment_from_altitude(
         self,
-        origin: ti.template(),
-        ray: ti.template(),
+        camera_altitude,
+        ray_cosine,
         bottom_radius,
     ):
-        """Return a horizon-continuous interval for cumulative aerial data.
-
-        A ground-hitting ray ends at its first ground intersection.  A grazing
-        ray that misses the reference sphere ends at closest approach instead
-        of the far atmosphere exit.  The two endpoints converge at tangency,
-        so neighboring froxels retain compatible normalized depth coordinates.
-        Outward rays, whose closest point is behind the camera, still end at
-        the atmosphere exit.
-        """
-
-        start, end, valid, ends_at_ground = self._atmosphere_segment(
-            origin,
-            ray,
-            bottom_radius,
+        start, end, valid, ends_at_ground = (
+            self._atmosphere_segment_from_altitude(
+                camera_altitude,
+                ray_cosine,
+                bottom_radius,
+            )
         )
         if valid and not ends_at_ground:
-            closest = -origin.dot(ray)
+            closest = -(bottom_radius + camera_altitude) * ray_cosine
             if closest > start and closest < end:
                 end = closest
         valid = valid and end > start
         return start, end, valid
 
     @ti.func
-    def _ray_intersects_ground(self, radius, cosine, bottom_radius):
-        radius = ti.max(radius, bottom_radius)
-        discriminant = (
-            radius * radius * (cosine * cosine - 1.0)
-            + bottom_radius * bottom_radius
+    def _distance_to_top_atmosphere(self, altitude, cosine, bottom_radius):
+        top_altitude = ti.static(self.config.top_altitude_m)
+        radius = bottom_radius + ti.max(altitude, 0.0)
+        shell_delta = (top_altitude - altitude) * (
+            2.0 * bottom_radius + top_altitude + altitude
         )
-        return cosine < 0.0 and discriminant >= 0.0
-
-    @ti.func
-    def _distance_to_top_atmosphere(self, radius, cosine, bottom_radius):
-        top_radius = bottom_radius + ti.static(self.config.top_altitude_m)
-        discriminant = (
-            radius * radius * (cosine * cosine - 1.0)
-            + top_radius * top_radius
-        )
+        discriminant = radius * radius * cosine * cosine + shell_delta
         return ti.max(
             -radius * cosine + ti.sqrt(ti.max(discriminant, 0.0)),
             0.0,
@@ -304,13 +402,13 @@ class AtmosphereRenderer:
     def _transmittance_uv_to_ray(self, u, v, bottom_radius):
         """Decode the distance-based spherical transmittance parameterization."""
 
-        top_radius = bottom_radius + ti.static(self.config.top_altitude_m)
-        shell_horizon = ti.sqrt(
-            ti.max(top_radius * top_radius - bottom_radius * bottom_radius, 0.0)
-        )
+        top_altitude = ti.static(self.config.top_altitude_m)
+        shell_horizon = self._shell_rho(top_altitude, bottom_radius)
         rho = shell_horizon * ti.math.clamp(v, 0.0, 1.0)
-        radius = ti.sqrt(rho * rho + bottom_radius * bottom_radius)
-        distance_min = top_radius - radius
+        radial_length = ti.sqrt(rho * rho + bottom_radius * bottom_radius)
+        altitude = rho * rho / ti.max(radial_length + bottom_radius, 1.0)
+        radius = bottom_radius + altitude
+        distance_min = top_altitude - altitude
         distance_max = rho + shell_horizon
         distance = distance_min + ti.math.clamp(u, 0.0, 1.0) * (
             distance_max - distance_min
@@ -318,28 +416,24 @@ class AtmosphereRenderer:
         cosine = 1.0
         if distance > 1.0e-6:
             cosine = (
-                top_radius * top_radius
-                - radius * radius
+                (top_altitude - altitude)
+                * (2.0 * bottom_radius + top_altitude + altitude)
                 - distance * distance
             ) / (2.0 * radius * distance)
-        return radius, ti.math.clamp(cosine, -1.0, 1.0), distance
+        return altitude, ti.math.clamp(cosine, -1.0, 1.0), distance
 
     @ti.func
-    def _transmittance_ray_to_uv(self, radius, cosine, bottom_radius):
-        top_radius = bottom_radius + ti.static(self.config.top_altitude_m)
-        radius = ti.math.clamp(radius, bottom_radius, top_radius)
-        shell_horizon = ti.sqrt(
-            ti.max(top_radius * top_radius - bottom_radius * bottom_radius, 0.0)
-        )
-        rho = ti.sqrt(
-            ti.max(radius * radius - bottom_radius * bottom_radius, 0.0)
-        )
+    def _transmittance_ray_to_uv(self, altitude, cosine, bottom_radius):
+        top_altitude = ti.static(self.config.top_altitude_m)
+        altitude = ti.math.clamp(altitude, 0.0, top_altitude)
+        shell_horizon = self._shell_rho(top_altitude, bottom_radius)
+        rho = self._shell_rho(altitude, bottom_radius)
         distance = self._distance_to_top_atmosphere(
-            radius,
+            altitude,
             cosine,
             bottom_radius,
         )
-        distance_min = top_radius - radius
+        distance_min = top_altitude - altitude
         distance_max = rho + shell_horizon
         u = (distance - distance_min) / ti.max(
             distance_max - distance_min,
@@ -377,18 +471,20 @@ class AtmosphereRenderer:
         return distance
 
     @ti.func
-    def _sky_horizon_zenith(self, camera_radius, bottom_radius):
-        radius = ti.max(camera_radius, bottom_radius + 1.0e-3)
-        tangent_cosine = ti.sqrt(
-            ti.max(radius * radius - bottom_radius * bottom_radius, 0.0)
-        ) / radius
+    def _sky_horizon_zenith(self, camera_altitude, bottom_radius):
+        altitude = ti.max(camera_altitude, 0.0)
+        radius = bottom_radius + altitude
+        tangent_cosine = self._shell_rho(altitude, bottom_radius) / ti.max(
+            radius,
+            1.0,
+        )
         return _PI - ti.acos(ti.math.clamp(tangent_cosine, 0.0, 1.0))
 
     @ti.func
-    def _sky_v_to_zenith(self, v, camera_radius, bottom_radius):
+    def _sky_v_to_zenith(self, v, camera_altitude, bottom_radius):
         """Decode a coordinate concentrated on both sides of the horizon."""
 
-        horizon = self._sky_horizon_zenith(camera_radius, bottom_radius)
+        horizon = self._sky_horizon_zenith(camera_altitude, bottom_radius)
         zenith = 0.0
         if v < 0.5:
             inverse = 1.0 - 2.0 * v
@@ -399,8 +495,8 @@ class AtmosphereRenderer:
         return zenith
 
     @ti.func
-    def _sky_zenith_to_v(self, zenith, camera_radius, bottom_radius):
-        horizon = self._sky_horizon_zenith(camera_radius, bottom_radius)
+    def _sky_zenith_to_v(self, zenith, camera_altitude, bottom_radius):
+        horizon = self._sky_horizon_zenith(camera_altitude, bottom_radius)
         v = 0.5
         if zenith < horizon:
             normalized = ti.math.clamp(zenith / ti.max(horizon, 1.0e-6), 0.0, 1.0)
@@ -415,16 +511,14 @@ class AtmosphereRenderer:
         return v
 
     @ti.func
-    def _sun_u_to_cosine(self, u, radius, bottom_radius):
+    def _sun_u_to_cosine(self, u, altitude, bottom_radius):
         """Decode a solar coordinate concentrated around the local horizon."""
 
-        radius = ti.max(radius, bottom_radius)
-        horizon_cosine = -ti.sqrt(
-            ti.max(
-                1.0 - bottom_radius * bottom_radius / (radius * radius),
-                0.0,
-            )
-        )
+        radius = bottom_radius + ti.max(altitude, 0.0)
+        horizon_cosine = -self._shell_rho(
+            altitude,
+            bottom_radius,
+        ) / ti.max(radius, 1.0)
         cosine = horizon_cosine
         if u < 0.5:
             inverse = 1.0 - 2.0 * u
@@ -439,14 +533,12 @@ class AtmosphereRenderer:
         return ti.math.clamp(cosine, -1.0, 1.0)
 
     @ti.func
-    def _sun_cosine_to_u(self, cosine, radius, bottom_radius):
-        radius = ti.max(radius, bottom_radius)
-        horizon_cosine = -ti.sqrt(
-            ti.max(
-                1.0 - bottom_radius * bottom_radius / (radius * radius),
-                0.0,
-            )
-        )
+    def _sun_cosine_to_u(self, cosine, altitude, bottom_radius):
+        radius = bottom_radius + ti.max(altitude, 0.0)
+        horizon_cosine = -self._shell_rho(
+            altitude,
+            bottom_radius,
+        ) / ti.max(radius, 1.0)
         u = 0.5
         if cosine < horizon_cosine:
             normalized = ti.math.clamp(
@@ -506,12 +598,11 @@ class AtmosphereRenderer:
         return ti.exp(-ti.min(optical_depth, 80.0))
 
     @ti.func
-    def _sample_transmittance_unoccluded(self, radius, cosine, bottom):
+    def _sample_transmittance_unoccluded(self, altitude, cosine, bottom):
         """Sample optical transmittance to the top boundary without occlusion."""
 
-        sample_radius = ti.max(radius, bottom)
         u, v = self._transmittance_ray_to_uv(
-            sample_radius,
+            ti.max(altitude, 0.0),
             cosine,
             bottom,
         )
@@ -540,29 +631,15 @@ class AtmosphereRenderer:
         return low * (1.0 - fy) + high * fy
 
     @ti.func
-    def _sample_transmittance(self, radius, cosine, bottom):
-        sample_radius = ti.max(radius, bottom)
-        blocked = self._ray_intersects_ground(sample_radius, cosine, bottom)
-        result = self._sample_transmittance_unoccluded(
-            sample_radius,
-            cosine,
-            bottom,
-        )
-        if blocked:
-            result = ti.Vector.zero(ti.f32, 3)
-        return result
-
-    @ti.func
-    def _sample_multi_scattering(self, radius, sun_cosine, bottom):
+    def _sample_multi_scattering(self, altitude, sun_cosine, bottom):
         altitude_fraction = ti.math.clamp(
-            (radius - bottom) / ti.static(self.config.top_altitude_m),
+            altitude / ti.static(self.config.top_altitude_m),
             0.0,
             1.0,
         )
-        sample_radius = ti.max(radius, bottom)
         u = self._sun_cosine_to_u(
             sun_cosine,
-            sample_radius,
+            ti.max(altitude, 0.0),
             bottom,
         )
         v = ti.sqrt(altitude_fraction)
@@ -642,20 +719,18 @@ class AtmosphereRenderer:
     @ti.func
     def _solar_disk_visibility(
         self,
-        radius,
+        altitude,
         sun_cosine,
         bottom_radius,
         angular_radius,
     ):
         """Fraction of a finite solar disk above the spherical horizon."""
 
-        radius = ti.max(radius, bottom_radius)
-        horizon_cosine = -ti.sqrt(
-            ti.max(
-                1.0 - bottom_radius * bottom_radius / (radius * radius),
-                0.0,
-            )
-        )
+        radius = bottom_radius + ti.max(altitude, 0.0)
+        horizon_cosine = -self._shell_rho(
+            altitude,
+            bottom_radius,
+        ) / ti.max(radius, 1.0)
         horizon_zenith = ti.acos(ti.math.clamp(horizon_cosine, -1.0, 1.0))
         sun_zenith = ti.acos(ti.math.clamp(sun_cosine, -1.0, 1.0))
         signed_separation = horizon_zenith - sun_zenith
@@ -672,24 +747,22 @@ class AtmosphereRenderer:
     @ti.func
     def _sample_solar_transmittance(
         self,
-        radius,
+        altitude,
         sun_cosine,
         bottom_radius,
         angular_radius,
     ):
         visibility = self._solar_disk_visibility(
-            radius,
+            altitude,
             sun_cosine,
             bottom_radius,
             angular_radius,
         )
-        radius = ti.max(radius, bottom_radius)
-        horizon_cosine = -ti.sqrt(
-            ti.max(
-                1.0 - bottom_radius * bottom_radius / (radius * radius),
-                0.0,
-            )
-        )
+        radius = bottom_radius + ti.max(altitude, 0.0)
+        horizon_cosine = -self._shell_rho(
+            altitude,
+            bottom_radius,
+        ) / ti.max(radius, 1.0)
         horizon_zenith = ti.acos(ti.math.clamp(horizon_cosine, -1.0, 1.0))
         sun_zenith = ti.acos(ti.math.clamp(sun_cosine, -1.0, 1.0))
         # When only part of the disk is visible its centre can lie below the
@@ -700,8 +773,8 @@ class AtmosphereRenderer:
             horizon_zenith - angular_radius * 0.25,
         )
         representative_cosine = ti.cos(ti.max(representative_zenith, 0.0))
-        return visibility * self._sample_transmittance(
-            radius,
+        return visibility * self._sample_transmittance_unoccluded(
+            altitude,
             representative_cosine,
             bottom_radius,
         )
@@ -737,6 +810,7 @@ class AtmosphereRenderer:
     def _scattering_source(
         self,
         point: ti.template(),
+        altitude,
         ray: ti.template(),
         sun: ti.template(),
         solar_irradiance: ti.template(),
@@ -746,11 +820,10 @@ class AtmosphereRenderer:
     ):
         radius = point.norm()
         radial = point / ti.max(radius, 1.0)
-        altitude = radius - bottom_radius
         density = self._density(altitude)
         sun_cosine = radial.dot(sun)
         sun_transmission = self._sample_solar_transmittance(
-            radius,
+            altitude,
             sun_cosine,
             bottom_radius,
             sun_angular_radius,
@@ -766,7 +839,7 @@ class AtmosphereRenderer:
         )
         if ti.static(include_multiple):
             multiple_radiance = self._sample_multi_scattering(
-                radius,
+                altitude,
                 sun_cosine,
                 bottom_radius,
             )
@@ -777,6 +850,7 @@ class AtmosphereRenderer:
     def _scattering_segment(
         self,
         origin: ti.template(),
+        origin_altitude,
         ray: ti.template(),
         start,
         end,
@@ -790,7 +864,14 @@ class AtmosphereRenderer:
         step = ti.max(end - start, 0.0)
         distance = (start + end) * 0.5
         point = origin + ray * distance
-        altitude = point.norm() - bottom_radius
+        origin_radius = ti.max(origin.norm(), 1.0)
+        origin_radial = origin / origin_radius
+        altitude = self._altitude_on_ray(
+            origin_altitude,
+            origin_radial.dot(ray),
+            distance,
+            bottom_radius,
+        )
         extinction = self._extinction(altitude)
         transmission, extinction_integral = self._segment_integral(
             extinction,
@@ -798,6 +879,7 @@ class AtmosphereRenderer:
         )
         source = self._scattering_source(
             point,
+            altitude,
             ray,
             sun,
             solar_irradiance,
@@ -811,6 +893,7 @@ class AtmosphereRenderer:
     def _terminator_refinement_weight(
         self,
         origin: ti.template(),
+        origin_altitude,
         ray: ti.template(),
         start,
         end,
@@ -854,10 +937,18 @@ class AtmosphereRenderer:
         proximity = proximity * proximity * (3.0 - 2.0 * proximity)
 
         point = origin + ray * midpoint
-        radius = point.norm()
-        radial = point / ti.max(radius, 1.0)
+        radius = ti.max(point.norm(), 1.0)
+        radial = point / radius
+        origin_radius = ti.max(origin.norm(), 1.0)
+        origin_radial = origin / origin_radius
+        altitude = self._altitude_on_ray(
+            origin_altitude,
+            origin_radial.dot(ray),
+            midpoint,
+            bottom_radius,
+        )
         visibility = self._solar_disk_visibility(
-            radius,
+            altitude,
             radial.dot(sun),
             bottom_radius,
             sun_angular_radius,
@@ -924,6 +1015,7 @@ class AtmosphereRenderer:
     def _integrate_adaptive_scattering_interval(
         self,
         origin: ti.template(),
+        origin_altitude,
         ray: ti.template(),
         start,
         end,
@@ -937,6 +1029,7 @@ class AtmosphereRenderer:
 
         coarse_radiance, coarse_transmission = self._scattering_segment(
             origin,
+            origin_altitude,
             ray,
             start,
             end,
@@ -963,6 +1056,7 @@ class AtmosphereRenderer:
                 child_end = start + (end - start) * fraction1
                 child_radiance, child_transmission = self._scattering_segment(
                     origin,
+                    origin_altitude,
                     ray,
                     child_start,
                     child_end,
@@ -992,12 +1086,13 @@ class AtmosphereRenderer:
             v = (ti.cast(y, ti.f32) + 0.5) / ti.static(
                 self.config.transmittance_lut_height
             )
-            radius, cosine, distance = self._transmittance_uv_to_ray(
+            altitude, cosine, distance = self._transmittance_uv_to_ray(
                 u,
                 v,
                 bottom_radius,
             )
             sine = ti.sqrt(ti.max(1.0 - cosine * cosine, 0.0))
+            radius = bottom_radius + altitude
             origin = ti.Vector([0.0, radius, 0.0])
             ray = ti.Vector([sine, cosine, 0.0])
             transmission = self._integrate_extinction(
@@ -1029,12 +1124,13 @@ class AtmosphereRenderer:
             v = (ti.cast(y, ti.f32) + 0.5) / ti.static(
                 self.config.multi_scattering_lut_height
             )
-            radius = bottom_radius + v * v * ti.static(
+            origin_altitude = v * v * ti.static(
                 self.config.top_altitude_m
             )
+            radius = bottom_radius + origin_altitude
             sun_cosine = self._sun_u_to_cosine(
                 u,
-                radius,
+                origin_altitude,
                 bottom_radius,
             )
             sun_sine = ti.sqrt(ti.max(1.0 - sun_cosine * sun_cosine, 0.0))
@@ -1088,13 +1184,19 @@ class AtmosphereRenderer:
                         distance = (distance0 + distance1) * 0.5
                         step = distance1 - distance0
                         point = origin + ray * distance
-                        altitude = point.norm() - bottom_radius
+                        altitude = self._altitude_on_ray(
+                            origin_altitude,
+                            direction_cosine,
+                            distance,
+                            bottom_radius,
+                        )
                         extinction = self._extinction(altitude)
                         segment_transmission, segment_integral = (
                             self._segment_integral(extinction, step)
                         )
                         direct_source = self._scattering_source(
                             point,
+                            altitude,
                             ray,
                             sun,
                             solar_irradiance,
@@ -1120,7 +1222,7 @@ class AtmosphereRenderer:
                         ground_normal = ground_point.normalized()
                         ground_sun_cosine = ground_normal.dot(sun)
                         ground_transmission = self._sample_solar_transmittance(
-                            bottom_radius,
+                            0.0,
                             ground_sun_cosine,
                             bottom_radius,
                             sun_angular_radius,
@@ -1153,14 +1255,15 @@ class AtmosphereRenderer:
     def _build_sky_view(
         self,
         bottom_radius: ti.f32,
-        camera_radius: ti.f32,
+        camera_altitude: ti.f32,
         sun_zenith_cosine: ti.f32,
         solar_irradiance: ti.types.vector(3, ti.f32),
         sun_angular_radius: ti.f32,
     ):
         sun_sine = ti.sqrt(ti.max(1.0 - sun_zenith_cosine**2, 0.0))
         sun = ti.Vector([sun_sine, sun_zenith_cosine, 0.0])
-        safe_camera_radius = ti.max(camera_radius, bottom_radius + 1.0e-3)
+        safe_camera_altitude = ti.max(camera_altitude, 0.0)
+        safe_camera_radius = bottom_radius + safe_camera_altitude
         origin = ti.Vector([0.0, safe_camera_radius, 0.0])
         for x, y in self.sky_view_lut:
             azimuth = (
@@ -1173,7 +1276,7 @@ class AtmosphereRenderer:
             )
             zenith = self._sky_v_to_zenith(
                 view_v,
-                safe_camera_radius,
+                safe_camera_altitude,
                 bottom_radius,
             )
             view_cosine = ti.cos(zenith)
@@ -1185,9 +1288,9 @@ class AtmosphereRenderer:
                     view_sine * ti.sin(azimuth),
                 ]
             )
-            start, end, valid, _ = self._atmosphere_segment(
-                origin,
-                ray,
+            start, end, valid, _ = self._atmosphere_segment_from_altitude(
+                safe_camera_altitude,
+                view_cosine,
                 bottom_radius,
             )
             radiance = ti.Vector.zero(ti.f32, 3)
@@ -1218,9 +1321,15 @@ class AtmosphereRenderer:
                     distance = (distance0 + distance1) * 0.5
                     step = distance1 - distance0
                     point = origin + ray * distance
-                    altitude = point.norm() - bottom_radius
+                    altitude = self._altitude_on_ray(
+                        safe_camera_altitude,
+                        view_cosine,
+                        distance,
+                        bottom_radius,
+                    )
                     source = self._scattering_source(
                         point,
+                        altitude,
                         ray,
                         sun,
                         solar_irradiance,
@@ -1242,7 +1351,7 @@ class AtmosphereRenderer:
     def _build_aerial_perspective(
         self,
         bottom_radius: ti.f32,
-        camera_radius: ti.f32,
+        camera_altitude: ti.f32,
         sun: ti.types.vector(3, ti.f32),
         solar_irradiance: ti.types.vector(3, ti.f32),
         sun_angular_radius: ti.f32,
@@ -1252,7 +1361,7 @@ class AtmosphereRenderer:
         tangent_half_fov: ti.f32,
     ):
         aspect = ti.cast(self.width, ti.f32) / self.height
-        origin = ti.Vector([0.0, camera_radius, 0.0])
+        origin = ti.Vector([0.0, bottom_radius + camera_altitude, 0.0])
         for x, y in ti.ndrange(
             ti.static(self.config.aerial_lut_width),
             ti.static(self.config.aerial_lut_height),
@@ -1268,10 +1377,12 @@ class AtmosphereRenderer:
             ray = (
                 right * sx + view_up * sy + forward / tangent_half_fov
             ).normalized()
-            atmosphere_start, atmosphere_end, valid = self._aerial_prefix_segment(
-                origin,
-                ray,
-                bottom_radius,
+            atmosphere_start, atmosphere_end, valid = (
+                self._aerial_prefix_segment_from_altitude(
+                    camera_altitude,
+                    ray.y,
+                    bottom_radius,
+                )
             )
             cumulative_radiance = ti.Vector.zero(ti.f32, 3)
             cumulative_transmission = ti.Vector([1.0, 1.0, 1.0])
@@ -1320,13 +1431,19 @@ class AtmosphereRenderer:
                             distance = (distance0 + distance1) * 0.5
                             step = distance1 - distance0
                             point = origin + ray * distance
-                            altitude = point.norm() - bottom_radius
+                            altitude = self._altitude_on_ray(
+                                camera_altitude,
+                                ray.y,
+                                distance,
+                                bottom_radius,
+                            )
                             extinction = self._extinction(altitude)
                             segment_transmission, segment_integral = (
                                 self._segment_integral(extinction, step)
                             )
                             source = self._scattering_source(
                                 point,
+                                altitude,
                                 ray,
                                 sun,
                                 solar_irradiance,
@@ -1354,14 +1471,16 @@ class AtmosphereRenderer:
         position_view: ti.template(),
         surface_id: ti.template(),
         bottom_radius: ti.f32,
-        camera_radius: ti.f32,
+        camera_altitude: ti.f32,
         sun: ti.types.vector(3, ti.f32),
         sun_angular_radius: ti.f32,
         right: ti.types.vector(3, ti.f32),
         view_up: ti.types.vector(3, ti.f32),
         forward: ti.types.vector(3, ti.f32),
     ):
-        camera_planet_position = ti.Vector([0.0, camera_radius, 0.0])
+        camera_planet_position = ti.Vector(
+            [0.0, bottom_radius + camera_altitude, 0.0]
+        )
         for pixel in ti.grouped(surface_id):
             solar_transmission = ti.Vector([1.0, 1.0, 1.0])
             sky_radiance = ti.Vector.zero(ti.f32, 3)
@@ -1375,15 +1494,23 @@ class AtmosphereRenderer:
                 planet_position = camera_planet_position + local_position
                 radius = planet_position.norm()
                 radial = planet_position / ti.max(radius, 1.0)
+                surface_distance = local_position.norm()
+                local_ray = local_position / ti.max(surface_distance, 1.0)
+                altitude = self._altitude_on_ray(
+                    camera_altitude,
+                    local_ray.y,
+                    surface_distance,
+                    bottom_radius,
+                )
                 sun_cosine = radial.dot(sun)
                 solar_transmission = self._sample_solar_transmittance(
-                    radius,
+                    altitude,
                     sun_cosine,
                     bottom_radius,
                     sun_angular_radius,
                 )
                 sky_radiance = self._sample_multi_scattering(
-                    radius,
+                    altitude,
                     sun_cosine,
                     bottom_radius,
                 )
@@ -1395,7 +1522,7 @@ class AtmosphereRenderer:
         self,
         ray: ti.template(),
         sun: ti.template(),
-        camera_radius,
+        camera_altitude,
         bottom_radius,
     ):
         zenith = ti.acos(ti.math.clamp(ray.y, -1.0, 1.0))
@@ -1416,7 +1543,7 @@ class AtmosphereRenderer:
         u = relative_azimuth / _PI
         v = self._sky_zenith_to_v(
             zenith,
-            camera_radius,
+            camera_altitude,
             bottom_radius,
         )
         x = ti.math.clamp(
@@ -1442,6 +1569,139 @@ class AtmosphereRenderer:
             x1, y1
         ] * fx
         return low * (1.0 - fy) + high * fy
+
+    @ti.func
+    def _integrate_camera_sky(
+        self,
+        camera_altitude,
+        ray: ti.template(),
+        sun: ti.template(),
+        solar_irradiance: ti.template(),
+        bottom_radius,
+        sun_angular_radius,
+    ):
+        """Integrate a high-frequency camera ray without angular LUT reuse."""
+
+        origin = ti.Vector(
+            [0.0, bottom_radius + camera_altitude, 0.0]
+        )
+        start, end, valid, _ = self._atmosphere_segment_from_altitude(
+            camera_altitude,
+            ray.y,
+            bottom_radius,
+        )
+        radiance = ti.Vector.zero(ti.f32, 3)
+        view_transmission = ti.Vector([1.0, 1.0, 1.0])
+        if valid:
+            root0, root1, valid0, valid1 = self._solar_shadow_roots(
+                origin,
+                ray,
+                sun,
+                bottom_radius,
+            )
+            index = 0
+            while index < ti.static(self.config.sky_horizon_direct_steps):
+                fraction0 = ti.cast(index, ti.f32) / ti.static(
+                    self.config.sky_horizon_direct_steps
+                )
+                fraction1 = ti.cast(index + 1, ti.f32) / ti.static(
+                    self.config.sky_horizon_direct_steps
+                )
+                distance0 = self._warped_interval_boundary(
+                    origin,
+                    ray,
+                    start,
+                    end,
+                    fraction0,
+                )
+                distance1 = self._warped_interval_boundary(
+                    origin,
+                    ray,
+                    start,
+                    end,
+                    fraction1,
+                )
+                refinement = self._terminator_refinement_weight(
+                    origin,
+                    camera_altitude,
+                    ray,
+                    distance0,
+                    distance1,
+                    sun,
+                    bottom_radius,
+                    sun_angular_radius,
+                    root0,
+                    root1,
+                    valid0,
+                    valid1,
+                )
+                interval_radiance, interval_transmission = (
+                    self._integrate_adaptive_scattering_interval(
+                        origin,
+                        camera_altitude,
+                        ray,
+                        distance0,
+                        distance1,
+                        sun,
+                        solar_irradiance,
+                        bottom_radius,
+                        sun_angular_radius,
+                        refinement,
+                    )
+                )
+                radiance += view_transmission * interval_radiance
+                view_transmission *= interval_transmission
+                index += 1
+        return ti.max(radiance, 0.0)
+
+    @ti.func
+    def _camera_sky_radiance(
+        self,
+        camera_altitude,
+        sky_lut_camera_altitude,
+        ray: ti.template(),
+        sun: ti.template(),
+        solar_irradiance: ti.template(),
+        bottom_radius,
+        sun_angular_radius,
+    ):
+        """Use the LUT for smooth sky and direct integration at the horizon."""
+
+        lut_radiance = self._sample_sky_view(
+            ray,
+            sun,
+            sky_lut_camera_altitude,
+            bottom_radius,
+        )
+        radius = bottom_radius + ti.max(camera_altitude, 0.0)
+        horizon_cosine = -self._shell_rho(
+            camera_altitude,
+            bottom_radius,
+        ) / ti.max(radius, 1.0)
+        width = ti.static(self.config.sky_horizon_direct_width_cosine)
+        direct_weight = ti.math.clamp(
+            1.0 - ti.abs(ray.y - horizon_cosine) / width,
+            0.0,
+            1.0,
+        )
+        direct_weight = direct_weight * direct_weight * (
+            3.0 - 2.0 * direct_weight
+        )
+        result = lut_radiance
+        if direct_weight > 0.0:
+            direct_radiance = self._integrate_camera_sky(
+                camera_altitude,
+                ray,
+                sun,
+                solar_irradiance,
+                bottom_radius,
+                sun_angular_radius,
+            )
+            result = (
+                lut_radiance * (1.0 - direct_weight)
+                + direct_radiance * direct_weight
+            )
+        return result
 
     @ti.func
     def _sample_aerial_field(
@@ -1495,14 +1755,13 @@ class AtmosphereRenderer:
         screen_u,
         screen_v,
         distance,
-        camera_radius,
+        camera_altitude,
         ray: ti.template(),
         bottom_radius,
     ):
-        origin = ti.Vector([0.0, camera_radius, 0.0])
-        start, end, valid = self._aerial_prefix_segment(
-            origin,
-            ray,
+        start, end, valid = self._aerial_prefix_segment_from_altitude(
+            camera_altitude,
+            ray.y,
             bottom_radius,
         )
         depth_fraction = 0.0
@@ -1524,6 +1783,7 @@ class AtmosphereRenderer:
     def _surface_segment_transmittance(
         self,
         origin: ti.template(),
+        origin_altitude,
         ray: ti.template(),
         surface_distance,
         bottom_radius,
@@ -1536,11 +1796,11 @@ class AtmosphereRenderer:
         """
 
         transmission = ti.Vector([1.0, 1.0, 1.0])
-        top_radius = bottom_radius + ti.static(self.config.top_altitude_m)
-        outer_near, outer_far, outer_hit = self._sphere_roots(
-            origin,
-            ray,
-            top_radius,
+        outer_near, outer_far, outer_hit = self._shell_roots_from_altitude(
+            origin_altitude,
+            ray.y,
+            ti.static(self.config.top_altitude_m),
+            bottom_radius,
         )
         start = ti.max(outer_near, 0.0)
         end = ti.min(surface_distance, outer_far)
@@ -1551,18 +1811,28 @@ class AtmosphereRenderer:
 
             near_length = near_point.norm()
             surface_length = surface_point.norm()
-            near_radius = ti.max(near_length, bottom_radius)
-            surface_radius = ti.max(surface_length, bottom_radius)
             near_radial = near_point / ti.max(near_length, 1.0)
             surface_radial = surface_point / ti.max(surface_length, 1.0)
+            near_altitude = self._altitude_on_ray(
+                origin_altitude,
+                ray.y,
+                start,
+                bottom_radius,
+            )
+            surface_altitude = self._altitude_on_ray(
+                origin_altitude,
+                ray.y,
+                end,
+                bottom_radius,
+            )
 
             surface_to_top = self._sample_transmittance_unoccluded(
-                surface_radius,
+                surface_altitude,
                 surface_radial.dot(reverse_ray),
                 bottom_radius,
             )
             near_to_top = self._sample_transmittance_unoccluded(
-                near_radius,
+                near_altitude,
                 near_radial.dot(reverse_ray),
                 bottom_radius,
             )
@@ -1577,6 +1847,7 @@ class AtmosphereRenderer:
     def _integrate_surface_scattering(
         self,
         origin: ti.template(),
+        origin_altitude,
         ray: ti.template(),
         surface_distance,
         sun: ti.template(),
@@ -1588,11 +1859,11 @@ class AtmosphereRenderer:
 
         radiance = ti.Vector.zero(ti.f32, 3)
         view_transmission = ti.Vector([1.0, 1.0, 1.0])
-        top_radius = bottom_radius + ti.static(self.config.top_altitude_m)
-        outer_near, outer_far, outer_hit = self._sphere_roots(
-            origin,
-            ray,
-            top_radius,
+        outer_near, outer_far, outer_hit = self._shell_roots_from_altitude(
+            origin_altitude,
+            ray.y,
+            ti.static(self.config.top_altitude_m),
+            bottom_radius,
         )
         start = ti.max(outer_near, 0.0)
         end = ti.min(surface_distance, outer_far)
@@ -1631,6 +1902,7 @@ class AtmosphereRenderer:
                 )
                 refinement_weight = self._terminator_refinement_weight(
                     origin,
+                    origin_altitude,
                     ray,
                     distance0,
                     distance1,
@@ -1645,6 +1917,7 @@ class AtmosphereRenderer:
                 interval_radiance, interval_transmission = (
                     self._integrate_adaptive_scattering_interval(
                         origin,
+                        origin_altitude,
                         ray,
                         distance0,
                         distance1,
@@ -1666,7 +1939,7 @@ class AtmosphereRenderer:
         screen_u,
         screen_v,
         surface_distance,
-        camera_radius,
+        camera_altitude,
         ray: ti.template(),
         sun: ti.template(),
         solar_irradiance: ti.template(),
@@ -1679,11 +1952,11 @@ class AtmosphereRenderer:
             screen_u,
             screen_v,
             surface_distance,
-            camera_radius,
+            camera_altitude,
             ray,
             bottom_radius,
         )
-        origin = ti.Vector([0.0, camera_radius, 0.0])
+        origin = ti.Vector([0.0, bottom_radius + camera_altitude, 0.0])
         surface_point = origin + ray * surface_distance
         surface_radius = surface_point.norm()
         surface_radial = surface_point / ti.max(surface_radius, 1.0)
@@ -1711,6 +1984,7 @@ class AtmosphereRenderer:
         if direct_weight > 0.0:
             direct = self._integrate_surface_scattering(
                 origin,
+                camera_altitude,
                 ray,
                 surface_distance,
                 sun,
@@ -1724,14 +1998,13 @@ class AtmosphereRenderer:
     @ti.func
     def _camera_transmittance(
         self,
-        camera_radius,
+        camera_altitude,
         ray: ti.template(),
         bottom_radius,
     ):
-        origin = ti.Vector([0.0, camera_radius, 0.0])
-        start, _, valid, ground = self._atmosphere_segment(
-            origin,
-            ray,
+        start, _, valid, ground = self._atmosphere_segment_from_altitude(
+            camera_altitude,
+            ray.y,
             bottom_radius,
         )
         transmission = ti.Vector([1.0, 1.0, 1.0])
@@ -1739,11 +2012,23 @@ class AtmosphereRenderer:
             if ground:
                 transmission = ti.Vector.zero(ti.f32, 3)
             else:
+                origin = ti.Vector(
+                    [0.0, bottom_radius + camera_altitude, 0.0]
+                )
                 entry = origin + ray * start
                 radius = entry.norm()
                 radial = entry / ti.max(radius, 1.0)
-                transmission = self._sample_transmittance(
-                    radius,
+                entry_altitude = self._altitude_on_ray(
+                    camera_altitude,
+                    ray.y,
+                    start,
+                    bottom_radius,
+                )
+                # `_atmosphere_segment_from_altitude` is the sole topology
+                # decision. Reclassifying this entry ray in the LUT sampler
+                # recreated grazing black arcs through rounding disagreement.
+                transmission = self._sample_transmittance_unoccluded(
+                    entry_altitude,
                     radial.dot(ray),
                     bottom_radius,
                 )
@@ -1757,8 +2042,8 @@ class AtmosphereRenderer:
         position_view: ti.template(),
         hdr: ti.template(),
         bottom_radius: ti.f32,
-        camera_radius: ti.f32,
-        sky_lut_camera_radius: ti.f32,
+        camera_altitude: ti.f32,
+        sky_lut_camera_altitude: ti.f32,
         sun_local: ti.types.vector(3, ti.f32),
         solar_irradiance: ti.types.vector(3, ti.f32),
         sun_disk_radiance: ti.types.vector(3, ti.f32),
@@ -1786,7 +2071,7 @@ class AtmosphereRenderer:
                         screen_u,
                         screen_v,
                         surface_distance,
-                        camera_radius,
+                        camera_altitude,
                         ray,
                         sun_local,
                         solar_irradiance,
@@ -1794,7 +2079,10 @@ class AtmosphereRenderer:
                         sun_angular_radius,
                     )
                     transmission = self._surface_segment_transmittance(
-                        ti.Vector([0.0, camera_radius, 0.0]),
+                        ti.Vector(
+                            [0.0, bottom_radius + camera_altitude, 0.0]
+                        ),
+                        camera_altitude,
                         ray,
                         surface_distance,
                         bottom_radius,
@@ -1802,16 +2090,19 @@ class AtmosphereRenderer:
                     color = scattering + color * transmission
                 else:
                     transmission = self._camera_transmittance(
-                        camera_radius,
+                        camera_altitude,
                         ray,
                         bottom_radius,
                     )
                     color = (
-                        self._sample_sky_view(
+                        self._camera_sky_radiance(
+                            camera_altitude,
+                            sky_lut_camera_altitude,
                             ray,
                             sun_local,
-                            sky_lut_camera_radius,
+                            solar_irradiance,
                             bottom_radius,
+                            sun_angular_radius,
                         )
                         + color * transmission
                     )
@@ -1841,12 +2132,12 @@ class AtmosphereRenderer:
                 color = self._sample_sky_view(
                     ray,
                     sun_local,
-                    sky_lut_camera_radius,
+                    sky_lut_camera_altitude,
                     bottom_radius,
                 )
             elif diagnostic_view == _DIAGNOSTIC_CAMERA_TRANSMITTANCE:
                 color = self._camera_transmittance(
-                    camera_radius,
+                    camera_altitude,
                     ray,
                     bottom_radius,
                 )
@@ -1893,7 +2184,7 @@ class AtmosphereRenderer:
                         screen_u,
                         screen_v,
                         position_view[pixel].norm(),
-                        camera_radius,
+                        camera_altitude,
                         ray,
                         sun_local,
                         solar_irradiance,
@@ -1904,7 +2195,10 @@ class AtmosphereRenderer:
                 color = ti.Vector.zero(ti.f32, 3)
                 if surface_id[pixel] >= 0:
                     color = self._surface_segment_transmittance(
-                        ti.Vector([0.0, camera_radius, 0.0]),
+                        ti.Vector(
+                            [0.0, bottom_radius + camera_altitude, 0.0]
+                        ),
+                        camera_altitude,
                         ray,
                         position_view[pixel].norm(),
                         bottom_radius,
@@ -1973,13 +2267,15 @@ class AtmosphereRenderer:
             self._sky_key = None
             self.multi_scattering_rebuilds += 1
 
-        # Key the view LUT by the exact values representable by its f32
-        # kernels.  The former altitude and sun-angle buckets made the whole
-        # sky remain stale and then jump at a bucket boundary.
-        camera_radius_key = float(np.float32(camera_radius))
+        # Keep altitude independent from the Earth-scale radius before the
+        # value enters an f32 kernel.  At R ~= 6.36e6 m a combined radius has
+        # a 0.5 m ULP, while a standalone sub-metre altitude remains precise.
+        camera_altitude_key = float(
+            np.float32(max(camera_radius - planet_radius, 0.0))
+        )
         sun_zenith_key = float(np.float32(np.clip(sun[1], -1.0, 1.0)))
         sky_key = (
-            camera_radius_key,
+            camera_altitude_key,
             sun_zenith_key,
             irradiance_key + (sun_angular_radius,),
         )
@@ -1988,13 +2284,13 @@ class AtmosphereRenderer:
         ):
             self._build_sky_view(
                 planet_radius,
-                camera_radius_key,
+                camera_altitude_key,
                 sun_zenith_key,
                 solar_irradiance,
                 sun_angular_radius,
             )
             self._sky_key = sky_key
-            self.sky_snapshot_altitude_m = camera_radius_key - planet_radius
+            self.sky_snapshot_altitude_m = camera_altitude_key
             self.sky_snapshot_sun_cosine = sun_zenith_key
             self.sky_view_rebuilds += 1
 
@@ -2015,6 +2311,7 @@ class AtmosphereRenderer:
         right, view_up, forward = view_basis
         camera_radius = float(camera_radius_m)
         planet_radius = float(planet_radius_m)
+        camera_altitude = max(camera_radius - planet_radius, 0.0)
         sun = tuple(float(value) for value in sun_local)
         sun_angular_radius = math.radians(sun_angular_radius_degrees)
         basis_right = tuple(float(value) for value in right)
@@ -2024,7 +2321,7 @@ class AtmosphereRenderer:
             position_view,
             surface_id,
             float(planet_radius_m),
-            float(camera_radius_m),
+            float(camera_altitude),
             sun,
             sun_angular_radius,
             basis_right,
@@ -2034,7 +2331,7 @@ class AtmosphereRenderer:
         if not self.luts_frozen or not self._aerial_available:
             self._build_aerial_perspective(
                 float(planet_radius_m),
-                float(camera_radius_m),
+                float(camera_altitude),
                 sun,
                 solar_irradiance,
                 sun_angular_radius,
@@ -2066,19 +2363,21 @@ class AtmosphereRenderer:
         ),
     ) -> None:
         right, view_up, forward = view_basis
-        sky_lut_camera_radius = float(camera_radius_m)
+        camera_altitude = max(
+            float(camera_radius_m) - float(planet_radius_m),
+            0.0,
+        )
+        sky_lut_camera_altitude = camera_altitude
         if self.sky_snapshot_altitude_m is not None:
-            sky_lut_camera_radius = (
-                float(planet_radius_m) + self.sky_snapshot_altitude_m
-            )
+            sky_lut_camera_altitude = self.sky_snapshot_altitude_m
         self._composite(
             scene_hdr,
             surface_id,
             position_view,
             hdr,
             float(planet_radius_m),
-            float(camera_radius_m),
-            sky_lut_camera_radius,
+            camera_altitude,
+            sky_lut_camera_altitude,
             tuple(float(value) for value in sun_local),
             solar_irradiance,
             sun_disk_radiance,

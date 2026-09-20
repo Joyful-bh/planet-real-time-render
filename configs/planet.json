@@ -48,6 +48,8 @@
     "multi_scattering_directions": 16,
     "multi_scattering_steps": 12,
     "sky_view_steps": 24,
+    "sky_horizon_direct_steps": 12,
+    "sky_horizon_direct_width_cosine": 0.04,
     "aerial_steps_per_slice": 2,
     "aerial_horizon_raymarch_steps": 12,
     "aerial_terminator_substeps": 8,
