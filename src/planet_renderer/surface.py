@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .height import HeightProvider
+from .height import TerrainHeightModel
 from .planet import PlanetModel, Vec3d, normalize
 from .terrain_lod import direction_to_cube_face_uv
 
@@ -38,7 +38,7 @@ def surface_cell_id(direction: Vec3d, level: int = 14) -> int:
 
 def describe_surface(
     planet: PlanetModel,
-    height_provider: HeightProvider,
+    height_model: TerrainHeightModel,
     direction_global: Vec3d,
     canonical_level: int = 14,
 ) -> SurfaceDescriptor:
@@ -60,7 +60,7 @@ def describe_surface(
 
     def position(sample_direction: Vec3d) -> np.ndarray:
         sample_direction = normalize(sample_direction)
-        height = height_provider.sample_height_m(sample_direction)
+        height = height_model.sample_height_m(sample_direction)
         return sample_direction * (planet.radius_m + height)
 
     normal = normalize(
@@ -74,7 +74,7 @@ def describe_surface(
     if float(np.dot(normal, direction)) < 0.0:
         normal = -normal
 
-    height = height_provider.sample_height_m(direction)
+    height = height_model.sample_height_m(direction)
     slope = 1.0 - max(float(np.dot(normal, direction)), 0.0)
     snow = float(np.clip((height - 2600.0) / 1800.0, 0.0, 1.0))
     rock = float(np.clip(slope * 7.0, 0.0, 1.0)) * (1.0 - snow)
@@ -89,12 +89,13 @@ def describe_surface(
     )
     weights /= max(float(weights.sum()), 1.0e-12)
 
+    cell_id = surface_cell_id(direction, canonical_level)
     return SurfaceDescriptor(
-        cell_id=surface_cell_id(direction, canonical_level),
+        cell_id=cell_id,
         height_m=height,
         normal_global=tuple(float(value) for value in normal),
         material_weights=tuple(float(value) for value in weights),
-        seed=height_provider.seed,
+        seed=(cell_id * 1_664_525 + 1_013_904_223) & 0x7FFFFFFF,
     )
 
 

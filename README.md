@@ -41,7 +41,8 @@
 - 球形地球与球壳大气是唯一稳定模型。
 - 密度随径向高度变化，包含 Rayleigh、Mie，后续加入臭氧吸收和多次散射近似。
 - 地表、云层、大气层顶和太空视角共享同一套物理定义。
-- 稳定版本最终使用 Transmittance、Multi-scattering、Sky-view 与 Aerial-perspective LUT；直接积分保留为参考与验证路径。
+- 稳定版本使用 Transmittance、Multi-scattering、Sky-view 与散射型 Aerial-perspective LUT；行星边缘采用有界直接积分，地表透射率根据真实 G-buffer 端点逐像素重建。
+- 交互预览提供逐阶段大气诊断视图及相机、地形 LOD、大气 LUT 独立冻结；使用方法见 `docs/ATMOSPHERE_DIAGNOSTICS.md`。
 - 太阳是方向光，同时以有限角半径圆盘可见，并参与地形、海洋、大气和云的统一照明。
 
 ### 云与星空
@@ -87,6 +88,20 @@ python -m pip install -e .
 python main.py --backend auto --preview
 python main.py --backend cuda --altitude-m 2000000 --pitch-degrees -35 --output output/space.png
 ```
+
+可以用独立配置直接切换测试尺度，不需要编辑参数文件：
+
+```bash
+# 50 km 半径的小行星尺度试验场（带风格化大气）
+python main.py --backend cuda --preview --config configs/asteroid.json
+
+# 6360 km 半径、100 km 大气层的类地配置
+python main.py --backend cuda --preview --config configs/earth.json
+```
+
+`configs/planet.json` 仍是默认配置，当前与 `asteroid.json` 使用相同的
+50 km 试验尺度。`asteroid.json` 的大气是用于跨尺度渲染调试的风格化设定，
+不表示真实的 50 km 小行星能够维持这样的大气。
 
 预览使用 WASD 沿局部切平面移动、空格径向上升、Shift 径向下降、按住鼠标左键拖动视角。参数面板可以跳转至地表、50 km 和 2000 km 高度，并显示径向高度、解析地平线距离和浮动原点 revision。
 

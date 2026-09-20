@@ -35,6 +35,7 @@ class TerrainTileManager:
         self,
         planet: PlanetModel,
         selector: MixedLodSelector,
+        height_range_m: tuple[float, float],
         max_slots: int = 256,
         cache_capacity: int = 1024,
         build_budget: int = 8,
@@ -49,6 +50,19 @@ class TerrainTileManager:
         self.upload_budget = upload_budget
         self.selection_interval_s = selection_interval_s
         self.queue_scan_budget = max(64, build_budget * 8)
+
+        minimum_height_m, maximum_height_m = height_range_m
+        if not (
+            math.isfinite(minimum_height_m)
+            and math.isfinite(maximum_height_m)
+            and minimum_height_m <= maximum_height_m
+        ):
+            raise ValueError("terrain height range must be finite and ordered")
+        self.max_terrain_displacement_m = max(
+            abs(minimum_height_m),
+            abs(maximum_height_m),
+        )
+        self.max_terrain_elevation_m = max(maximum_height_m, 0.0)
 
         self.records: dict[PatchKey, PatchRecord] = {}
         self.queue: list[tuple[float, int, PatchKey]] = []
@@ -80,10 +94,8 @@ class TerrainTileManager:
         self._boundary_cache: dict[PatchKey, tuple[int, int]] = {}
         self._visibility_signature: tuple | None = None
         self._visible_cache: set[PatchKey] = set()
-
-        # Current procedural terrain spans roughly -5 km..8.5 km. Keep a
-        # conservative bound for horizon and frustum culling.
-        self.max_terrain_relief_m = 10_000.0
+        self._prefetch_selection_time = -1.0e9
+        self._prefetch_cache: set[PatchKey] = set()
 
     def _patch_bounds(
         self,
@@ -121,7 +133,7 @@ class TerrainTileManager:
             float(np.linalg.norm(direction * self.planet.radius_m - center_world))
             for direction in sample_dirs
         )
-        world_radius = surface_radius + self.max_terrain_relief_m
+        world_radius = surface_radius + self.max_terrain_displacement_m
 
         result = (center_world, angular_radius, world_radius)
         self._bounds_cache[key] = result
@@ -130,9 +142,6 @@ class TerrainTileManager:
     def _descriptor(
         self,
         key: PatchKey,
-        camera: PlanetCamera,
-        viewport_height: int,
-        priority: float = 0.0,
         skirt_mask: int = 0,
         stitch_mask: int = 0,
     ) -> TerrainPatchRenderDescriptor:
@@ -143,8 +152,6 @@ class TerrainTileManager:
         return TerrainPatchRenderDescriptor(
             key=key,
             anchor_global=anchor,
-            sse=self.selector.sse(key, camera, viewport_height),
-            priority=priority,
             skirt_mask=skirt_mask,
             stitch_mask=stitch_mask,
         )
@@ -195,13 +202,11 @@ class TerrainTileManager:
         motion_bias = 0.0
         if velocity_direction is not None:
             motion_bias = max(float(np.dot(delta_direction, velocity_direction)), 0.0)
-        focal = viewport_height / (
-            2.0 * math.tan(math.radians(camera.vertical_fov_degrees) * 0.5)
-        )
-        geometric_error = (
-            self.planet.radius_m * 2.4 / ((1 << key.level) * self.selector.resolution)
-        )
-        sse = geometric_error * focal / distance
+        # Keep streaming priority consistent with the selector.  The selector's
+        # SSE includes unresolved relief reported by the active terrain model;
+        # using the old sphere-only estimate here could leave a nearby mountain
+        # request behind visually flat ocean patches.
+        sse = self.selector.sse(key, camera, viewport_height)
         return (
             sse * 1000.0
             + center_bias * 100.0
@@ -289,8 +294,10 @@ class TerrainTileManager:
 
         # Prefetch children in the movement direction. They are not part of
         # ``desired`` until a later selector update.
-        prefetch: set[PatchKey] = set()
-        if velocity_direction is not None:
+        if (
+            velocity_direction is not None
+            and self._prefetch_selection_time != self._last_selection
+        ):
             ranked = sorted(
                 self.desired,
                 key=lambda key: self._priority(
@@ -302,24 +309,32 @@ class TerrainTileManager:
                 ),
                 reverse=True,
             )[:2]
+            prefetch: set[PatchKey] = set()
             for key in ranked:
                 if key.level >= self.selector.max_level:
                     continue
                 for child in key.children():
                     prefetch.add(child)
-                    existing = self.records.get(child)
-                    if existing is None or existing.state == PatchState.UNLOADED:
-                        self._request(
-                            child,
-                            self._priority(
-                                child,
-                                camera,
-                                viewport_height,
-                                velocity_direction,
-                                forward,
-                            )
-                            * 0.25,
-                        )
+            self._prefetch_cache = prefetch
+            self._prefetch_selection_time = self._last_selection
+        elif velocity_direction is None:
+            self._prefetch_cache = set()
+
+        prefetch = self._prefetch_cache
+        for child in prefetch:
+            existing = self.records.get(child)
+            if existing is None or existing.state == PatchState.UNLOADED:
+                self._request(
+                    child,
+                    self._priority(
+                        child,
+                        camera,
+                        viewport_height,
+                        velocity_direction,
+                        forward,
+                    )
+                    * 0.25,
+                )
 
         active_requests = needed | prefetch
         for record in self.records.values():
@@ -361,26 +376,24 @@ class TerrainTileManager:
         ready = sorted(
             (
                 record
-                for record in self.records.values()
-                if record.state == PatchState.READY and record.key in active_requests
+                for key in active_requests
+                if (record := self.records.get(key)) is not None
+                and record.state == PatchState.READY
             ),
             key=lambda record: record.priority,
             reverse=True,
         )
+        upload_limit = min(len(ready), self.upload_budget)
+        slots_needed = max(upload_limit - len(self.free_slots), 0)
+        self._evict_many(needed, pending_releases, slots_needed)
         for record in ready:
             if uploaded >= self.upload_budget:
                 break
-            if not self.free_slots and not self._evict_one(
-                needed,
-                pending_releases,
-            ):
+            if not self.free_slots:
                 break
             slot = self.free_slots.pop()
             descriptor = self._descriptor(
                 record.key,
-                camera,
-                viewport_height,
-                record.priority,
             )
             pending_uploads.append(PatchUploadRequest(slot, descriptor))
             record.slot = slot
@@ -425,9 +438,7 @@ class TerrainTileManager:
         visible = set(self._visible_cache)
         visible_signature = frozenset(visible)
         if visible_signature != self._boundary_signature:
-            self._boundary_cache = {
-                key: self.selector.boundary_masks(key, visible) for key in visible
-            }
+            self._boundary_cache = self.selector.boundary_masks_all(visible)
             self._boundary_signature = visible_signature
 
         descriptors: list[TerrainPatchRenderDescriptor] = []
@@ -439,9 +450,6 @@ class TerrainTileManager:
             descriptors.append(
                 self._descriptor(
                     key,
-                    camera,
-                    viewport_height,
-                    record.priority,
                     skirt_mask,
                     stitch_mask,
                 )
@@ -565,7 +573,7 @@ class TerrainTileManager:
         if camera_radius > planet_radius + 1.0:
             horizon_angle = math.acos(np.clip(planet_radius / camera_radius, -1.0, 1.0))
             relief_angle = math.acos(
-                planet_radius / (planet_radius + self.max_terrain_relief_m)
+                planet_radius / (planet_radius + self.max_terrain_elevation_m)
             )
             separation = math.acos(
                 float(np.clip(np.dot(center_dir, camera_dir), -1.0, 1.0))
@@ -592,14 +600,7 @@ class TerrainTileManager:
         return True
 
     def _visible_batch(self, keys: set[PatchKey], context) -> set[PatchKey]:
-        """Cull a coverage set with vectorized NumPy dot products.
-
-        Visibility is a CPU-side decision, but it runs for every camera update.
-        The scalar implementation performed several ``acos``/``norm`` calls
-        per patch and became visible in profiles before any GPU work started.
-        Bounds are immutable for a patch, so only the camera-dependent matrix
-        operations remain on subsequent frames.
-        """
+        """Cull immutable patch bounds in one NumPy batch."""
 
         if not keys:
             return set()
@@ -641,12 +642,10 @@ class TerrainTileManager:
             )
             relief_angle = math.acos(
                 self.planet.radius_m
-                / (self.planet.radius_m + self.max_terrain_relief_m)
+                / (self.planet.radius_m + self.max_terrain_elevation_m)
             )
             center_dirs = centers / self.planet.radius_m
-            separation = np.arccos(
-                np.clip(center_dirs @ camera_dir, -1.0, 1.0)
-            )
+            separation = np.arccos(np.clip(center_dirs @ camera_dir, -1.0, 1.0))
             visible &= separation <= (
                 horizon_angle + self._visibility_angular + relief_angle
             )
@@ -671,9 +670,14 @@ class TerrainTileManager:
 
         while True:
             replacements: set[PatchKey] = set()
+            leaf_index = self.selector._build_leaf_index(coverage)
             for key in tuple(coverage):
                 for edge in range(4):
-                    neighbor = self.selector._neighbor(coverage, key, edge)
+                    neighbor = self.selector._neighbor_indexed(
+                        leaf_index,
+                        key,
+                        edge,
+                    )
                     if neighbor is not None and key.level - neighbor.level > 1:
                         parent = key.parent()
                         if parent is not None and parent in self.resident:
@@ -693,29 +697,39 @@ class TerrainTileManager:
                 )
                 coverage.add(parent)
 
-    def _evict_one(
+    def _evict_many(
         self,
         needed: set[PatchKey],
         pending_releases: list[PatchReleaseRequest],
-    ) -> bool:
-        candidates = [
-            record
-            for record in self.records.values()
-            if record.state == PatchState.GPU_RESIDENT
-            and record.key not in needed
-            and record.key not in self.render_keys
-        ]
-        if not candidates:
-            return False
-        victim = min(candidates, key=lambda record: record.last_used_frame)
-        if victim.slot is None:
-            return False
-        pending_releases.append(PatchReleaseRequest(victim.slot))
-        self.free_slots.append(victim.slot)
-        self.resident.discard(victim.key)
-        victim.slot = None
-        victim.state = PatchState.READY
-        return True
+        count: int,
+    ) -> int:
+        """Release up to ``count`` LRU slots after one resident-set scan."""
+
+        if count <= 0:
+            return 0
+        candidates = sorted(
+            (
+                record
+                for key in self.resident
+                if key not in needed
+                and key not in self.render_keys
+                and (record := self.records.get(key)) is not None
+                and record.slot is not None
+            ),
+            key=lambda record: record.last_used_frame,
+        )
+        released = 0
+        for victim in candidates[:count]:
+            slot = victim.slot
+            if slot is None:
+                continue
+            pending_releases.append(PatchReleaseRequest(slot))
+            self.free_slots.append(slot)
+            self.resident.discard(victim.key)
+            victim.slot = None
+            victim.state = PatchState.READY
+            released += 1
+        return released
 
     def _trim_record_cache(self, needed: set[PatchKey]) -> None:
         excess = len(self.records) - self.cache_capacity

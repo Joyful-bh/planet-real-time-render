@@ -1,12 +1,19 @@
 """M0 配置结构。"""
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from .atmosphere import AtmosphereConfig
+from .postprocess import PostprocessConfig
+from .terrain_config import TerrainConfig
+
+CURRENT_CONFIG_VERSION = 3
 
 
 @dataclass(frozen=True)
 class M0Config:
+    config_version: int = CURRENT_CONFIG_VERSION
     width: int = 1280
     height: int = 720
     planet_radius_m: float = 6_360_000.0
@@ -18,11 +25,11 @@ class M0Config:
     sun_elevation_degrees: float = 32.0
     sun_angular_radius_degrees: float = 0.266
     solar_irradiance: tuple[float, float, float] = (4.0, 3.9, 3.7)
-    sun_disk_radiance: tuple[float, float, float] = (80.0, 74.0, 62.0)
     surface_albedo: tuple[float, float, float] = (0.16, 0.20, 0.12)
-    exposure_ev: float = 0.0
     floating_origin_threshold_m: float = 10_000.0
-    terrain_seed: int = 7
+    atmosphere: AtmosphereConfig = field(default_factory=AtmosphereConfig)
+    postprocess: PostprocessConfig = field(default_factory=PostprocessConfig)
+    terrain: TerrainConfig = field(default_factory=TerrainConfig)
     terrain_patch_resolution: int = 12
     terrain_max_level: int = 16
     terrain_split_sse_pixels: float = 64.0
@@ -33,6 +40,7 @@ class M0Config:
     terrain_upload_budget_per_frame: int = 4
     terrain_lod_changes_per_update: int = 8
     terrain_cache_capacity: int = 1024
+    terrain_update_interval_frames: int = 2
 
 
 def _triple(value: object, name: str) -> tuple[float, float, float]:
@@ -43,11 +51,27 @@ def _triple(value: object, name: str) -> tuple[float, float, float]:
 
 def load_config(path: Path) -> M0Config:
     data = json.loads(path.read_text(encoding="utf-8"))
-    r, p, c, l, t = (
+    config_version = int(data.get("config_version", 0))
+    if config_version != CURRENT_CONFIG_VERSION:
+        raise ValueError(
+            f"配置版本必须为 {CURRENT_CONFIG_VERSION}，当前为 {config_version}；"
+            "v3 removes lighting.sun_disk_radiance and moves exposure_ev "
+            "from rendering to postprocess"
+        )
+    r, p, c, l, a, pp, t = (
         data.get(k, {})
-        for k in ("rendering", "planet", "camera", "lighting", "terrain")
+        for k in (
+            "rendering",
+            "planet",
+            "camera",
+            "lighting",
+            "atmosphere",
+            "postprocess",
+            "terrain",
+        )
     )
     config = M0Config(
+        config_version=config_version,
         width=int(r.get("width", 1280)),
         height=int(r.get("height", 720)),
         planet_radius_m=float(p.get("radius_m", 6_360_000.0)),
@@ -61,17 +85,18 @@ def load_config(path: Path) -> M0Config:
         solar_irradiance=_triple(
             l.get("solar_irradiance", [4.0, 3.9, 3.7]), "solar_irradiance"
         ),
-        sun_disk_radiance=_triple(
-            l.get("sun_disk_radiance", [80.0, 74.0, 62.0]), "sun_disk_radiance"
-        ),
         surface_albedo=_triple(
             p.get("surface_albedo", [0.16, 0.20, 0.12]), "surface_albedo"
         ),
-        exposure_ev=float(r.get("exposure_ev", 0.0)),
         floating_origin_threshold_m=float(
             c.get("floating_origin_threshold_m", 10_000.0)
         ),
-        terrain_seed=int(t.get("seed", 7)),
+        atmosphere=AtmosphereConfig.from_mapping(a),
+        postprocess=PostprocessConfig.from_mapping(pp),
+        terrain=TerrainConfig(
+            generator=t.get("generator", "procedural_fbm_v1"),
+            params=t.get("params", {}),
+        ),
         terrain_patch_resolution=int(t.get("patch_resolution", 12)),
         terrain_max_level=int(t.get("max_level", 16)),
         terrain_split_sse_pixels=float(
@@ -84,6 +109,7 @@ def load_config(path: Path) -> M0Config:
         terrain_upload_budget_per_frame=int(t.get("upload_budget_per_frame", 4)),
         terrain_lod_changes_per_update=int(t.get("lod_changes_per_update", 8)),
         terrain_cache_capacity=int(t.get("cache_capacity", 1024)),
+        terrain_update_interval_frames=int(t.get("update_interval_frames", 2)),
     )
     if not 16 <= config.width <= 16384 or not 16 <= config.height <= 16384:
         raise ValueError("分辨率必须在 16..16384 范围")
@@ -98,4 +124,6 @@ def load_config(path: Path) -> M0Config:
         raise ValueError("terrain patch_resolution 或 patch 容量超出范围")
     if not 0.0 < config.terrain_merge_sse_pixels < config.terrain_split_sse_pixels:
         raise ValueError("terrain merge_sse_pixels 必须小于 split_sse_pixels")
+    if not 1 <= config.terrain_update_interval_frames <= 8:
+        raise ValueError("terrain update_interval_frames must be in 1..8")
     return config

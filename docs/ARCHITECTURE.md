@@ -36,10 +36,12 @@
 
 ### `terrain`
 
-负责球面分块、四叉树 LOD、可见性和高度源调度，并输出网格生成所需的轻量 descriptor。高度源分为：
+负责球面分块、四叉树 LOD、可见性和高度源调度，并输出网格生成所需的轻量 descriptor。地形配置分为两层：
 
-- `ProceduralHeightProvider`：固定种子的多尺度行星噪声；
-- `DemHeightProvider`：真实数据切片、重投影、缓存和缺失值处理。
+- 外层 `TerrainConfig` 只包含稳定的生成器 ID 和不透明 `params`；
+- `TerrainFactory` 通过显式 Registry 找到生成器，并将 `params` 转换为该算法自己的强类型配置；
+- `procedural_landforms_v1` 是默认分区地貌生成器，`procedural_fbm_v1` 保留为较小的参考实现；两者拥有各自的强类型内部配置，未来算法同样不得向外层信封增加地貌语义字段；
+- `DemTerrainModel` 预留真实数据切片、重投影、缓存和缺失值处理边界。
 
 高度源只返回规范化位置对应的高度及必要元数据，不负责渲染。
 
@@ -236,3 +238,95 @@ geometry-side slot fields (`offset`, `normal`, `height_m`, material weights and
 surface cells). `PlanetRenderer` accesses those fields only through its
 explicit `terrain_renderer` component; its own kernels handle camera-relative
 transforms, clipping, rasterization, G-buffer writes and compositing.
+
+## M3.1-M3.2 Atmosphere foundation and sky pipeline
+
+The stable atmosphere is a finite spherical shell concentric with the active
+`PlanetModel`. `AtmosphereConfig` stores the shell height, density profiles,
+inverse-metre optical coefficients and LUT quality, but deliberately does not
+duplicate the planet radius. The CPU `AtmosphereModel` is a float64 validation
+oracle for shell intersections, Rayleigh/Mie/absorption density, extinction,
+transmittance and direct single scattering. It is not a runtime fallback.
+
+The realtime `AtmosphereRenderer` owns a linear-HDR RGB Transmittance LUT. Its
+vertical coordinate is normalized distance from the planet-radius cylinder and
+its horizontal coordinate reconstructs the distance to the atmosphere top.
+Rays hidden by the opaque planet are rejected analytically before lookup. This
+distance parameterization preserves substantially more resolution around the
+spherical horizon than a uniform zenith-cosine texture.
+
+The linear-HDR Sky-View LUT is parameterized by relative solar azimuth and by
+two horizon-centred view-zenith domains. Both the sky and ground halves converge
+on the analytical horizon, preventing a single uniform-angle texel from
+covering the complete limb gradient. The transmittance texture is rebuilt only
+when the planet/atmosphere definition changes. Sky-View is keyed by exact f32
+camera radius and local solar zenith plus its lighting inputs; camera yaw alone
+does not rebuild it.
+
+GPU geometry stays camera-relative. In the local East-Up-North frame the camera
+is the origin and the planet centre is represented analytically as
+`(0, -camera_radius, 0)`, where the radius was computed in CPU float64. The GPU
+does not receive absolute global positions for atmosphere integration.
+
+Frame composition is now:
+
+```text
+G-buffer -> surface lighting -> surface_hdr
+         -> sky-view lookup + attenuated finite sun disk -> hdr
+         -> exposure -> half-resolution bloom -> tone-map/sRGB -> display
+```
+
+`LightingState` stores solar irradiance and angular radius as the only solar
+energy inputs. The uniform visible-disk radiance is derived from
+`irradiance / (pi*sin(angular_radius)^2)`; it is not an independently
+art-directed value. This keeps the disk, atmospheric scattering and every
+surface consumer on one radiometric scale. Bloom operates only on the final
+composite and never modifies `hdr`; raw transmittance and mask diagnostics
+bypass exposure, bloom and tone mapping.
+
+M3.3 adds a view-dependent Aerial-Perspective froxel volume, but the volume is
+only a low-frequency cache for RGB in-scattering. It is not authoritative for
+camera-to-surface transmittance: opaque pixels reconstruct that value from the
+actual G-buffer endpoint with two samples of the spherical Transmittance LUT.
+This keeps transmittance at full screen/depth resolution and avoids assigning
+different physical meanings to the same trilinearly interpolated froxel depth.
+
+Near the projected planetary limb, optical depth and in-scattering vary too
+quickly for the coarse angular froxel grid. A smooth radial-cosine band switches
+from cached scattering to a bounded per-pixel integration along the real
+camera-to-G-buffer path. Away from that band the cheaper volume remains active.
+The hybrid keeps the common case inexpensive while making the horizon path
+independent of analytical ground-hit classification and terrain displacement.
+The direct path uses two-scale quadrature: base intervals remain concentrated
+around the ray's minimum altitude, while intervals near intersections with the
+central solar-shadow cylinder receive local substeps. A smooth refinement
+weight blends the base and refined estimates, so moving the terminator across
+an interval does not expose a second sampling boundary. Finite-disk visibility
+still supplies the physical penumbra; the shadow cylinder is used only to find
+where that source term needs more samples. Surface rays crossing this narrow
+terminator band select the same direct path even when they lie just inside the
+ordinary limb band; this prevents the coarse froxel cache from reintroducing
+the high-frequency source that the direct quadrature was designed to resolve.
+M3.4 adds a static altitude/solar-zenith
+Multi-Scattering LUT. Its directional integration estimates the returning
+scattered-light factor and sums higher orders as a bounded geometric series;
+ground bounce uses the configured Lambertian atmosphere ground albedo.
+
+Before surface shading, the atmosphere computes per-visible-pixel sunlight
+transmittance and mean sky radiance from the same LUTs. Formal terrain lighting
+therefore uses attenuated `solar_irradiance / pi` plus atmospheric sky light;
+the former fixed ambient term is gone. Debug material/LOD/Patch modes remain
+unlit so diagnostic colors are not hidden by atmospheric conditions.
+
+Transmittance and Multi-Scattering LUTs rebuild only when their static inputs
+change, Sky-View rebuilds after any camera-radius or local-solar change visible
+to the f32 GPU kernels, and the scattering-only Aerial-Perspective volume
+rebuilds every view frame. Path integration uses variable-width intervals
+concentrated around the minimum-altitude point. Direct sunlight uses finite-disk visibility at the
+spherical horizon instead of a binary centre-ray shadow. The quality controls
+`aerial_horizon_raymarch_steps` and `aerial_terminator_substeps` respectively
+set the inexpensive base quadrature and the local refinement, rather than
+requiring the expensive count everywhere. Dynamic
+weather/aerosol corrections remain later M3 work and must invalidate these
+resources through the same ownership path rather than add a second sky
+implementation.

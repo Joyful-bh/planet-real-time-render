@@ -383,9 +383,12 @@ atomic counter, so `_bin` iterates only the emitted range. Rasterization uses a
 pixel-driven fast path for low tile overdraw; after periodic GPU overdraw
 sampling it switches to a triangle-fragment atomic depth pass and one
 per-pixel G-buffer resolve when tile candidate counts become high.
-The high-overdraw path now consumes a dense tile/triangle-pair stream emitted
-by `_bin`; it no longer launches over the full `tiles × 512` candidate
-capacity.
+The high-overdraw path directly rasterizes compact clipped-triangle screen
+bounds and no longer consumes the bounded per-tile candidate list. The
+low-overdraw path keeps its fast 512-entry tile list, but any overflowing tile
+is recomputed from the complete triangle stream in the same frame before
+shading. Overflow therefore selects a slower correctness fallback instead of
+discarding geometry.
 
 ### Verification
 
@@ -408,16 +411,560 @@ means were 11.30 ms and 14.48 ms respectively, still with zero tile overflow.
 The final dense tile-pair run measured 11.35 ms stable and 14.39 ms moving;
 the small difference is normal run-to-run variance.
 
+### High-density correctness follow-up
+
+Reducing terrain SSE to `4/2` raised the visible set to 172 patches and about
+231,000 triangles. Horizon tiles exceeded 512 candidates, and both former
+raster paths consumed the same truncated list, leaving irregular black holes.
+The direct atomic path now has no per-tile capacity. The pixel path launches a
+GPU-only overflow repair for affected tiles without a CPU synchronization.
+The true maximum candidate count and overflow total are retained as diagnostics
+and shown in Preview; they no longer imply missing triangles.
+
+The focused CPU smoke test compiles both raster strategies and produces a
+finite G-buffer. High-density CUDA visual verification remains user-run.
+
+An earlier moving profile had a long upload tail (P99 45.86 ms). It was
+isolated to repeatedly marshalling several external arrays into the terrain
+generation kernels, rather than GPU terrain computation. The persistent
+device staging descriptor described below resolves that stall.
+
+### 2026-09 performance follow-up
+
+Profiling a later renderer revision confirmed that normal tiles were again
+entering the atomic depth path after its threshold had been reduced to 64.
+The threshold is restored to 256, and both raster variants are compiled during
+startup so a later adaptive switch cannot introduce a one-second interactive
+JIT stall.
+
+CPU patch visibility is vectorized again and immutable patch anchors/bounds
+are cached. Renderer preparation now submits anchor upload, buffer clearing
+and vertex transformation together; welding and mixed-LOD stitching are also
+submitted together. Patch upload descriptors use one persistent device
+staging field rather than passing several external arrays to three kernels.
+
+The synchronized RTX 3050 Laptop GPU comparison at 1280x720 measured 10.86 ms
+stable and 13.33 ms moving before the final staging change, corresponding to
+92.1 and 75.0 FPS. Stable frame times no longer contain the adaptive-raster
+JIT spike. A focused 60-frame moving check after device staging reduced upload
+P99 from 47.14 ms to 2.52 ms and the maximum from 66.98 ms to 3.06 ms. Visual
+continuity remains a user-run preview acceptance check.
+
+## BUG-0013: High-speed low-altitude flight caused streaming-frame stalls
+
+- Status: `fixed`
+- Phase: M2 terrain streaming/performance
+- Symptom: sustained flight near 4 km altitude at roughly 12 km/s could fall
+  to about 14 FPS even though only 40--80 patches were visible.
+- Root cause: rapidly changing render sets rebuilt patch-edge identity through
+  Python dictionaries and repeatedly marshalled several variable or
+  maximum-capacity edge arrays. Once residency filled, upload selection also
+  scanned every cached READY record and performed a full resident-set scan for
+  each individual eviction. These costs were outside the terrain manager's
+  UI `upload_ms`, so the panel misleadingly reported sub-millisecond uploads.
+
+### Fix
+
+Patch edge identities are cached and welded through a vectorized sort. Weld
+and stitch data share one compact operation stream containing only live
+records. Prefetch ranking is refreshed with the LOD selection rather than on
+every frame. READY selection now iterates the small active-request set, and a
+batch LRU eviction performs one resident scan for the whole upload budget.
+The profiler accepts an explicit initial altitude so this flight regime is a
+repeatable benchmark rather than being represented by the old 25 m/frame
+surface test.
+
+### Verification
+
+At 1280x720 on the RTX 3050 Laptop GPU, the targeted 3.85 km altitude,
+200 m/frame test improved from 26.59 ms (37.6 FPS) to 14.71 ms (68.0 FPS)
+before the final batch-eviction change. GPU rendering remained about 7--8 ms;
+the improvement came from removing host-side streaming work. The M2 terrain
+tests pass. Interactive visual validation remains user-run.
+
+### 2026-09 landform-fidelity performance follow-up
+
+Lowering SSE to 4/2 and enabling `procedural_landforms_v1` raised the moving
+2 km workload to 138--183 visible patches and roughly 185k--246k submitted
+triangles. A synchronized 60-frame diagnostic initially measured 87.60 ms per
+frame (11.4 FPS). GPU residency was only 342--378 of 512 slots, proving that
+the regression was not caused by a full GPU Patch cache. The dominant costs
+were repeated CPU leaf-neighbor lookup, unused per-descriptor SSE evaluation,
+render-edge rebuilding and 16x16 tile candidate scans.
+
+Render descriptors now contain only data consumed by the renderer. Boundary
+masks use one compact integer leaf index per set, fixed edge topology is
+cached, edge-operation staging uses one allocation, and selector metadata has
+a fixed 2048-entry default bound. Raster tiles are 8x8, reducing the last-frame
+mean candidate count from 17.05 to 7.03 without overflow. Per-camera SSE values
+are cached for the current update.
+
+The same synchronized workload then measured 45.82 ms (21.8 FPS) with terrain
+updated every render frame. With the preview's decoupled 1-in-2 terrain cadence
+it measured 24.05 ms (41.6 FPS), a 16.23 ms median and no tile overflow. Pure
+CPU terrain selection now runs on a single back-pressured worker in Preview;
+the main thread applies only the newest completed incremental frame and never
+queues stale camera snapshots. Visual smoothness of this asynchronous path
+remains an interactive user acceptance check.
+
+## ISSUE-0014: Procedural terrain logic was coupled to rendering
+
+- Status: `fixed`
+- Phase: M2 terrain architecture
+- Symptom: changing the procedural terrain algorithm required coordinating a
+  CPU height provider, a separate GPU descriptor and renderer-local Taichi
+  noise functions. These implementations could silently diverge.
+- Root cause: the renderer owned terrain-generation equations while the world
+  data layer owned a second CPU implementation; the height-source contract
+  described data but not executable terrain behaviour.
+
+### Fix
+
+`TerrainHeightModel` now defines the renderer-independent height contract.
+`FbmTerrainGenerator` owns its typed config plus adjacent CPU and Taichi
+sampling implementations. `TerrainRenderer` receives a model explicitly and calls
+its GPU sampler. The old provider, source and GPU descriptor APIs were removed
+rather than retained as compatibility aliases. Inputs are normalized global
+directions and outputs are radial heights in metres.
+
+### Verification
+
+The source tree compiles, old API identifiers are absent, and the focused M2
+CPU-render test passes while comparing generated GPU-path vertex heights with
+the CPU model. Full visual acceptance remains user-run.
+
+## ISSUE-0015: Terrain algorithm parameters leaked into application config
+
+- Status: `fixed`
+- Phase: M2 terrain architecture
+- Symptom: the application configuration and construction sites knew the
+  current procedural algorithm's `seed`, while adding or replacing algorithm
+  fields required edits outside the algorithm module.
+- Root cause: there was no distinction between selecting a terrain algorithm
+  and validating that algorithm's private parameter schema.
+
+### Fix
+
+The external `TerrainConfig` is now a thin envelope containing only a stable,
+versioned generator ID and an uninterpreted parameter mapping. An explicit
+Registry and Factory resolve `procedural_fbm_v1`, construct its private
+`FbmTerrainConfig`, and return `FbmTerrainGenerator`. The renderer receives
+only the resulting `TerrainHeightModel`. The general height contract also no
+longer requires a `seed`; stable surface-cell seeds are derived independently.
+The model reports a conservative height range so visibility code no longer
+contains the former FBM-specific 10 km relief constant.
+
+### Verification
+
+Configuration loading and factory construction were checked with the project
+JSON. Focused tests cover valid conversion, unknown generator IDs and invalid
+algorithm parameters. Source compilation passes; visual acceptance remains
+user-run.
+
+## ISSUE-0016: Landform semantics and LOD detail were not represented
+
+- Status: `fixed`
+- Phase: M2 procedural terrain fidelity
+- Symptom: the reference FBM produced height but no stable distinction between
+  oceans, plains, mountain belts, plateaus, basins and canyons. Formal rendering
+  reused the height-debug palette, normals exposed low-order mesh derivatives,
+  and low-altitude terrain could remain visibly polygonal after the selector
+  claimed to have converged.
+- Root cause: LOD error was derived only from sphere curvature. The 2:1
+  balancing pass also coarsened every newly refined patch next to a coarse
+  neighbor. A following merge could remove a required transition-ring patch
+  and recreate it during balancing in the same update, leaving the final set
+  unchanged despite large remaining SSE.
+
+### Fix
+
+`procedural_landforms_v1` now combines a warped continent/ocean field with
+regional mountain belts, flat plateau provinces, basins, canyon contours and
+frequency-separated local detail. CPU and Taichi samplers return height plus
+normalized semantic weights. Each generator reports unresolved local relief,
+which is combined with sphere curvature for SSE and used by request priority.
+The default target is reduced to 4 px split / 2 px merge.
+
+Balanced splits now recursively build only the minimal coarse-neighbor
+transition ring under the existing per-update and leaf budgets. Merge rejects
+operations that would violate the 2:1 invariant. Fully hidden patches can
+remain coarse behind the spherical horizon while resident parents retain
+coverage. Patch normals use fourth-order centered mesh differences where a
+full stencil exists and share the existing welded edge result at boundaries.
+
+Formal surface rendering is separate from the height, LOD and Patch ID debug
+views. It combines semantic material weights, radial slope, a shared global
+sun direction and shared solar irradiance. Ocean, fertile ground, arid ground,
+rock and snow therefore remain readable without coupling the terrain generator
+to final RGB colors.
+
+### Verification
+
+Focused registry, landform-weight, terrain-frame and mixed-LOD tests pass. The
+small CPU G-buffer test passes both raster paths and verifies finite output.
+CUDA images were rendered after LOD settling at 100 km (space), 20 km, 2 km
+clearance and 120 m clearance into `output/landform_checks_final/`. Inspection
+showed continuous coastlines, regional mountain/lowland structure, finer
+low-altitude silhouettes and no new black holes, Patch cracks or normal flips.
+
 ### Remaining limitation
 
-The tile lookup array still has a fixed overflow cap (`512` candidates per
-tile), so extreme overdraw is reported as overflow and requires a future
-prefix-sum or hierarchical binning pass for full scalability. Normal frames
-no longer scan that unused capacity on either raster path.
+The 50 km test planet intentionally exaggerates relief, and the fixed 256-leaf
+budget can become the active constraint before every patch reaches the 4 px
+target. Negative-elevation terrain is currently colored as water but remains
+terrain geometry; a level spherical water surface and water lighting belong to
+the later ocean milestone. The procedural model does not yet simulate erosion
+or drainage networks, so canyon contours are deterministic shape fields rather
+than hydrological rivers.
 
-The final moving profile still has a long tail (P99 frame 63.72 ms; P99
-`terrain_upload_dispatch_ms` 45.86 ms) despite a 14.39 ms mean. The GPU
-raster kernels take roughly 2.5 ms per frame in total in this workload, so these stalls
-are an upload/driver or CPU streaming scheduling problem rather than a
-triangle coverage problem; a future timeline/fence pass must isolate it
-before increasing terrain density.
+## ISSUE-0017: Sky, sun and display composition were coupled to surface shading
+
+- Status: `fixed`
+- Phase: M3 atmosphere architecture
+- Symptom: the surface shading kernel directly emitted the space background,
+  an unattenuated solar disk, final HDR and display-encoded color. A spherical
+  participating medium could not be inserted without mixing atmosphere math
+  into the terrain renderer or overwriting the original surface radiance.
+- Root cause: M1 established a deliberately compact terminal shading pass, but
+  the frame had no explicit linear-HDR boundary between opaque surfaces,
+  atmosphere composition and post-processing.
+
+### Fix
+
+The opaque pass now writes `surface_hdr`. An independent
+`AtmosphereRenderer` owns Transmittance and Sky-View LUTs, composites physical
+Rayleigh/Mie single scattering and the atmosphere-attenuated finite solar disk
+for background pixels, then writes final `hdr` and display output. The CPU
+float64 `AtmosphereModel` provides the reference shell, density, optical-depth
+and single-scattering equations. Runtime GPU geometry uses camera radius and a
+local analytical planet centre rather than absolute float32 planet positions.
+
+### Verification
+
+Focused CPU tests cover inside/outside sphere roots, opaque-ground interval
+termination, non-negative density/scattering and bounded transmittance. A
+small CPU Taichi render compiled both raster strategies plus both atmosphere
+LUT kernels and produced finite G-buffer/output data. Interactive validation
+at the surface, horizon, 20 km and space remains user-run.
+
+### M3.3-M3.4 completion
+
+Opaque terrain now consumes a low-resolution Aerial-Perspective volume storing
+cumulative RGB scattering, while camera-to-surface transmittance is
+reconstructed per pixel from the 2-D Transmittance LUT. The sky and aerial integrators
+also sample a static Multi-Scattering LUT with bounded higher-order feedback
+and Lambertian ground bounce. Terrain direct light is attenuated along the
+surface-to-sun path, while its former fixed ambient term is replaced by mean
+atmospheric sky radiance from the same multiple-scattering solution.
+
+The remaining approximation is LUT resolution and the production-oriented
+isotropic higher-order closure; it is not a second atmosphere model. Dynamic
+weather/aerosol modulation and a dedicated high-quality surface irradiance LUT
+remain future extensions.
+
+## ISSUE-0018: Full-resolution aerial ray marching would not scale
+
+- Status: `fixed`
+- Phase: M3 atmosphere performance architecture
+- Symptom: applying in-scattering and extinction separately to every opaque
+  pixel would add tens of atmosphere samples at display resolution, consuming
+  the performance budget needed by later ocean and cloud stages.
+- Root cause: the G-buffer exposed exact surface distance, but there was no
+  reusable view-space representation of integrated atmosphere transport.
+
+### Fix
+
+A small camera-frustum Aerial-Perspective LUT integrates each view ray once and
+stores cumulative radiance over normalized slices of its actual atmospheric
+segment. The common-case full-screen pass uses trilinear reconstruction, while
+the planetary-limb band performs a bounded direct integration. Surface
+transmittance uses two full-resolution 2-D LUT lookups instead of the froxel.
+Static transmittance and multiple scattering are shared by Sky-View, aerial
+perspective and surface lighting instead of recomputing long sun paths.
+
+### Verification
+
+The focused Taichi CPU smoke render compiles all four LUT paths, checks finite
+non-negative scattering, bounded transmittance, non-zero sky/multiple/aerial
+radiance and finite final HDR output. High-resolution CUDA timing and visual
+acceptance across the four canonical altitudes remain user-run.
+
+### Remaining limitation
+
+The aerial volume currently rebuilds every frame and uses fixed configured
+spatial dimensions. Temporal reprojection and adaptive quality are deferred
+until profiling demonstrates that this low-resolution pass is material.
+
+## ISSUE-0019: Atmosphere discontinuities could not be isolated by stage
+
+- Status: `fixed in code; cross-scale visual acceptance pending`
+- Phase: M3 atmosphere validation
+- Symptom: low-altitude views can show a dark horizontal band, the apparent
+  horizon can move in discrete steps during vertical travel, and the daytime
+  sky is difficult to evaluate independently from exposure, terrain LOD and
+  final surface composition.
+- Suspected causes: quantized Sky-View invalidation, insufficient sampling near
+  the spherical horizon and planet-shadow boundary, low-order multi-scattering
+  approximation, and uncalibrated small-planet optical depth.  A separate
+  terrain silhouette change remains possible because terrain Geomorph is not
+  implemented.
+
+### Diagnostic baseline
+
+The preview can now display reconstructed Sky-View radiance, camera-ray
+transmittance, raw Transmittance and Multi-Scattering textures, Aerial-
+Perspective scattering/transmittance and the binary G-buffer surface mask.
+View-dependent atmosphere LUT generation, terrain LOD updates and camera input
+can be frozen independently.  The panel reports the captured Sky-View altitude,
+camera yaw/pitch, freeze state and rebuild counters.  This makes atmosphere
+updates distinguishable from opaque geometry changes without introducing a
+second rendering path.
+
+### Verification
+
+Sky-View no longer uses altitude or solar-angle buckets: its key contains the
+exact camera radius and local solar cosine representable by the f32 kernels.
+Transmittance now uses the distance-to-top spherical mapping and rejects
+ground-blocked rays analytically. Sky-View concentrates angular samples on
+both sides of the analytical horizon. Transmittance, sky, multiple-scattering
+and aerial integrations use variable-width intervals concentrated around the
+minimum-altitude point, and finite solar-disk visibility softens the
+planet-shadow boundary. Generated texel centres and lookup coordinates now use
+the same half-texel convention.
+
+Source compilation and the small CPU render smoke test pass. The smoke test
+moves the camera by two metres, below the former altitude bucket, and verifies
+that frozen LUTs remain unchanged and resume with an immediate Sky-View/Aerial
+rebuild. It also checks every diagnostic view for finite bounded display
+output. Cross-scale visual acceptance using the procedure in
+`docs/ATMOSPHERE_DIAGNOSTICS.md` remains user-run.
+
+### Remaining work
+
+Physical atmosphere calibration, terrain morphing and ocean geometry remain
+separate work. Multi-Scattering remains a bounded low-order approximation, and
+the finite-disk optical-depth sample uses one representative visible direction
+rather than integrating many samples over the solar disk. These limitations
+must not be hidden with exposure or post-processing.
+
+## ISSUE-0020: Formal surface shading was discontinuous at Patch boundaries
+
+- Status: `fixed in code; visual acceptance pending`
+- Phase: M2/M3 surface integration
+- Symptom: stable ledges or broad shading discontinuities appeared along some
+  same-level and mixed-LOD Patch boundaries. The Surface Mask, Height and LOD
+  diagnostic views remained continuous, and freezing terrain LOD left the
+  artifact unchanged.
+- Root cause: the edge-fix kernel treated generated resident attributes as
+  mutable frame data. Welding and stitching overwrote persistent normals,
+  heights, materials and cell IDs in GPU Patch slots. Those edits survived
+  later render-set and adjacency changes until a Patch happened to be rebuilt.
+  In addition, welding copied one Patch's one-sided boundary normal to its
+  neighbor instead of constructing a common normal from all incident Patch
+  estimates. Unlit diagnostic modes hid both errors, while formal directional
+  lighting made the normal discontinuity prominent.
+
+### Fix
+
+The renderer now copies resident attributes into explicit frame-local normal,
+height, material and cell streams during frame preparation. Edge welding and
+mixed-LOD stitching modify only those streams and the frame-local view
+positions; generated Patch slots remain immutable. Each exact shared-vertex
+group accumulates the normals from all incident Patches, normalizes the common
+result and writes that identical normal back to every member. Stitched fine
+vertices then interpolate the already-welded endpoints. Clipping and
+rasterization consume only the resulting frame-local attributes.
+
+### Verification
+
+The focused CPU render regression compiles both raster paths, verifies exact
+shared positions and matching shared normals, and asserts that resident normal,
+height, material and cell fields are byte-for-byte unchanged after rendering.
+The test passes. Visual validation at the originally reported boundary remains
+user-run.
+
+## ISSUE-0021: Solar disk and atmosphere used unrelated radiometric scales
+
+- Status: `fixed in code; visual calibration pending`
+- Phase: M3 atmosphere radiometry and post-processing
+- Symptom: the daytime sky remained dark outside the forward Mie lobe, while
+  the solar disk looked like a separate flat white object with a clearly
+  detached halo. The documented HDR pipeline included Bloom, but the runtime
+  path performed only exposure, an ACES fit and sRGB encoding.
+- Root cause: `solar_irradiance` drove scattering and surface lighting while an
+  independently configured `sun_disk_radiance` drove the visible disk. Their
+  ratio did not equal the finite disk's projected solid angle, so the two representations
+  of the same sun could not be energy-consistent. Display conversion also
+  lived inside atmosphere composition, leaving no real post-processing stage.
+
+### Fix
+
+`LightingState` now owns only solar irradiance and angular radius. Uniform disk
+radiance is derived from `E = L * pi*sin(alpha)^2`, making terrain,
+atmosphere and the visible sun consume one energy scale. Configuration version
+3 removes `lighting.sun_disk_radiance` and places exposure plus Bloom controls
+in a dedicated `postprocess` group.
+
+Atmosphere composition now stops at an untouched linear `hdr` buffer. A
+dedicated `PostProcessor` applies exposure, soft-knee bright-pass extraction,
+configurable separable half-resolution Gaussian passes, ACES tone mapping and sRGB
+encoding. Bloom is enabled only for the final composite, so it joins the
+finite disk to its physical Mie aureole without contaminating Sky-View or LUT
+diagnostics. Raw transmittance and surface-mask views bypass the complete
+display-lighting transform.
+
+### Verification
+
+Unit tests verify that integrating derived disk radiance over its projected solid angle
+recovers the configured RGB irradiance. The configuration-v3 file loads, all
+changed sources compile, and the focused 64x48 CPU Taichi render passes both
+raster paths, atmosphere diagnostics and the new post-processing kernels.
+Interactive exposure/Bloom calibration at the surface, 20 km and space remains
+user-run.
+
+### Remaining limitation
+
+This establishes a consistent scale but does not yet replace the bounded
+isotropic Multi-Scattering approximation or implement automatic camera
+exposure. Those should be changed only if fixed-view HDR probes show an energy
+deficit after visual validation, rather than compensating with arbitrary sky
+offsets.
+
+### Visual acceptance follow-up
+
+The first Bloom implementation failed visual acceptance: the physically
+derived solar radiance (about tens of thousands in the current HDR scale) was
+fed unbounded into a small finite-support blur. Most of that rectangular
+support tone-mapped to white, enlarging the sun into a nearly square bright
+block instead of producing a decaying glare tail. The disk itself also used a
+binary pixel-centre test, so its geometric edge had no subpixel coverage.
+
+The finite disk now uses analytical angular distance with a one-pixel smooth
+coverage filter. Bloom bright-pass values retain their RGB ratio but are
+bounded before convolution to the range represented by the realtime kernel;
+four low-energy Gaussian passes then create a soft tail without redefining the
+disk silhouette. This correction compiles and passes the focused 64x48 CPU
+render regression; interactive visual acceptance remains pending and the
+earlier failed appearance is not considered a successful P3 result.
+
+## ISSUE-0022: Earth-scale aerial perspective produced dark froxel bands
+
+- Status: `fixed in code; visual acceptance pending`
+- Phase: M3 aerial perspective / cross-scale continuity
+- Symptom: the Earth-radius preset showed broad black spots and horizontal or
+  vertical dark bands on the unlit hemisphere. The artifacts were isolated in
+  the Aerial Scattering diagnostic and followed the coarse froxel grid rather
+  than terrain Patch or LOD boundaries.
+- Root cause: every view ray shared a depth axis derived from the camera's
+  global horizon distance, with cubic spacing concentrated near the camera.
+  From an Earth-scale space view this range spans millions of metres, although
+  scattering occurs only in the roughly 100 km atmosphere segment near the
+  ray's far end. Only a few of 32 depth slices therefore represented active
+  medium, and trilinear reconstruction enlarged their transitions into bands.
+  Angular generation used texel centres while reconstruction used an endpoint
+  coordinate convention, adding a half-texel spatial offset.
+
+### Fix
+
+Each aerial froxel ray now parameterizes depth from its own atmosphere entry to
+its horizon-continuous prefix endpoint: the first ground intersection for a
+ground hit, closest approach for a grazing miss, or atmosphere exit for an
+outward ray. All depth layers therefore sample active medium independently of
+planet radius and camera distance.
+Runtime sampling reconstructs the same normalized per-ray coordinate, and the
+angular axes now use the matching half-texel convention. The Earth preset uses
+a 96 x 54 x 64 aerial volume; the small-planet preset retains its cheaper
+quality setting.
+
+### Verification
+
+Configuration parsing, Python compilation and the focused CPU atmosphere smoke
+render cover the new kernel signature and finite output. Visual acceptance of
+the previously reported Earth-scale dark-side view remains user-run.
+
+### Remaining limitation
+
+The froxel volume is still view dependent and rebuilt every active frame.
+Adaptive angular resolution and temporal reconstruction remain performance
+work; they must not reintroduce a planet-scale physical-distance depth axis.
+
+### Horizon-continuity follow-up
+
+The first per-ray implementation still used atmosphere exit as the endpoint
+for a ray that narrowly missed the reference sphere. Its immediate neighbor
+could narrowly hit the sphere and use the near ground intersection instead.
+Although both choices were individually valid, their normalized depth axes
+were topologically discontinuous at the horizon. Angular interpolation mixed
+unrelated depths, producing intermittent bright/dark spots in Aerial
+Transmittance and visible stepwise changes during camera motion.
+
+Grazing misses now end at their forward closest-approach point. As a ground
+intersection approaches tangency, its near root converges continuously to that
+same point. This keeps neighboring froxel depth coordinates compatible at the
+silhouette without integrating through the planet or reverting to a global
+camera-distance axis.
+
+### Production-path refactor after incomplete visual acceptance
+
+Visual testing showed that endpoint continuity alone was insufficient. The
+remaining scallops repeated at roughly 13 pixels, matching the Earth preset's
+`1280 / 96` and `720 / 54` aerial-froxel footprint. Near a grazing ray,
+transmittance is exponential in optical depth and changes much faster than the
+uniform angular grid. More fundamentally, the same normalized depth still
+represented different physical distances and altitudes in adjacent rays, so
+ordinary trilinear interpolation was not physically meaningful. The analytic
+reference sphere could also classify a ray as a miss while displaced terrain
+still produced a G-buffer hit.
+
+The aerial volume is now scattering-only. Camera-to-surface RGB transmittance
+is reconstructed per pixel from the actual G-buffer distance using the ratio of
+two unoccluded Transmittance-LUT samples along the reverse ray. This removes
+angular froxel interpolation from the quantity where the artifact was most
+visible. Scattering keeps the inexpensive volume in low-frequency regions, but
+smoothly switches to bounded per-pixel integration when the surface radial/view
+cosine enters a configurable limb band. The direct path integrates to the real
+terrain endpoint, not an analytic ground intersection.
+
+Earth-scale sphere roots now evaluate the discriminant as
+`(radius - perpendicular_distance) * (radius + perpendicular_distance)` instead
+of subtracting two squared million-metre quantities. The old 3-D aerial
+transmittance field and its internal API were removed rather than retained as a
+second, inconsistent source of truth.
+
+New quality controls are `aerial_horizon_raymarch_steps`,
+`aerial_horizon_inner_cosine` and `aerial_horizon_outer_cosine`. The two cosine
+values define the smooth direct-to-froxel transition; they are not angular
+resolution multipliers.
+
+The focused CPU render regression compiles both raster paths and every
+atmosphere diagnostic with the refactored kernels, checks finite HDR/display
+output and bounded transmittance, and passes. CUDA performance and visual
+acceptance at the reported Earth-space and low-altitude views remain user-run.
+
+### Terminator-scattering follow-up
+
+After full-resolution camera-to-surface transmittance passed visual acceptance,
+the Earth preset still showed smaller bright blocks in `Aerial scattering`,
+especially where the distant limb met the dawn/dusk terminator. Raising the
+fixed direct-integration count from 16 to 48 only reduced their size. This
+isolated a second error: a long grazing path used deterministic midpoint
+quadrature, while finite-disk sunlight and sun-path optical depth can change
+inside a much narrower interval. Neighboring rays therefore moved whole
+midpoint samples between shadow and light.
+
+The direct limb integrator now intersects each camera ray with the central
+solar-shadow cylinder and treats those roots as sampling features, not binary
+visibility. It retains altitude-warped base intervals, but continuously blends
+each base estimate with a locally subdivided estimate near a shadow root or
+inside the finite-disk penumbra. This makes the quadrature estimate continuous
+as the feature crosses an interval boundary and avoids paying the refined cost
+over the complete atmosphere segment. A narrow, smoothly faded surface-path
+band around the same roots also selects direct integration outside the ordinary
+limb-cosine band, so the low-resolution froxel cache cannot reintroduce the
+terminator discontinuity. `aerial_terminator_substeps` controls the local
+refinement; the Earth base count is restored to 16 with eight local substeps
+instead of retaining the diagnostic 48-step global march.
+
+Source compilation and a focused CPU kernel smoke test cover the new control,
+shadow-root feature calculation and finite output. Final CUDA visual acceptance
+at an Earth-scale space terminator remains user-run.

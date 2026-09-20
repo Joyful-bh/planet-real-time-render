@@ -80,9 +80,31 @@ class PlanetGeometryTests(unittest.TestCase):
 
     def test_static_lighting_snapshot_identity(self) -> None:
         state = LightingState(
-            np.array([1.0, 2.0, 3.0]), 0.266, (1.0, 1.0, 1.0), (50.0, 50.0, 50.0)
+            np.array([1.0, 2.0, 3.0]), 0.266, (1.0, 1.0, 1.0)
         )
         self.assertIs(StaticLightingProvider(state).snapshot(), state)
+
+    def test_solar_disk_radiance_integrates_to_irradiance(self) -> None:
+        state = LightingState(
+            np.array([0.0, 1.0, 0.0]),
+            0.266,
+            (4.0, 3.9, 3.7),
+        )
+        integrated = (
+            np.asarray(state.sun_disk_radiance)
+            * state.sun_projected_solid_angle_sr
+        )
+        np.testing.assert_allclose(integrated, state.solar_irradiance, rtol=1.0e-12)
+
+        smaller_disk = LightingState(
+            np.array([0.0, 1.0, 0.0]),
+            0.133,
+            state.solar_irradiance,
+        )
+        self.assertGreater(
+            smaller_disk.sun_disk_radiance[0],
+            state.sun_disk_radiance[0],
+        )
 
 
 if __name__ == "__main__":

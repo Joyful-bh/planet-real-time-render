@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .camera import PlanetCamera
-from .height import DemHeightProvider, HeightProvider, ProceduralHeightProvider
+from .height import DemTerrainModel, TerrainHeightModel
 from .planet import PlanetModel, Vec3d
+from .fbm_terrain import FbmTerrainConfig, FbmTerrainGenerator
+from .landforms_terrain import LandformsTerrainConfig, LandformsTerrainGenerator
 from .surface import SurfaceDescriptor, describe_surface, surface_cell_id
 from .terrain_lod import (MixedLodSelector, cube_face_direction,
                           direction_to_cube_face_uv)
@@ -63,15 +65,15 @@ class CubeSphereTerrain:
     def __init__(
         self,
         planet: PlanetModel,
-        height_source: HeightProvider,
+        height_model: TerrainHeightModel,
         settings: TerrainSettings,
     ) -> None:
         self.planet = planet
-        self.height_provider = height_source
-        self.height_source = height_source
+        self.height_model = height_model
         self.settings = settings
         self.selector = MixedLodSelector(
             planet,
+            height_model,
             settings.patch_resolution,
             settings.max_level,
             settings.split_sse_pixels,
@@ -82,6 +84,7 @@ class CubeSphereTerrain:
         self.tile_manager = TerrainTileManager(
             planet,
             self.selector,
+            height_model.height_range_m,
             settings.max_gpu_patches,
             settings.cache_capacity,
             settings.build_budget_per_frame,
@@ -131,7 +134,7 @@ class CubeSphereTerrain:
     def describe_surface(self, direction_global: Vec3d) -> SurfaceDescriptor:
         return describe_surface(
             self.planet,
-            self.height_provider,
+            self.height_model,
             direction_global,
             self.settings.canonical_surface_level,
         )
@@ -150,8 +153,11 @@ __all__ = [
     "PatchReleaseRequest",
     "TerrainDebugStats",
     "TerrainFrame",
-    "ProceduralHeightProvider",
-    "DemHeightProvider",
+    "FbmTerrainConfig",
+    "FbmTerrainGenerator",
+    "LandformsTerrainConfig",
+    "LandformsTerrainGenerator",
+    "DemTerrainModel",
     "cube_face_direction",
     "direction_to_cube_face_uv",
     "surface_cell_id",

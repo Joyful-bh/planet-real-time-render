@@ -37,6 +37,19 @@ python tools/profile_m2.py --backend cuda --scenario both --json output/m2_profi
 
 脚本有意在 Terrain Update 和 Render 后分别执行 `ti.sync()`。这会扰动流水并降低吞吐量，因此数据用于归因，不代替 Preview 的最终 FPS。重点比较同一机器、后端、配置下各阶段和不同版本的相对变化。
 
+`--terrain-update-interval-frames` 可覆盖预览地形更新节奏。默认读取配置中的
+`terrain.update_interval_frames`。跳过的帧仍使用最新相机渲染已有 Patch，只有
+LOD、驻留和 Render Set 更新被降频；这与 Preview 的运行方式一致。
+
+2026-09 的 2 km、200 m/帧、1280x720 CUDA 对比结果保存在：
+
+- `output/m2_landforms_move_profile.json`：修改前，87.60 ms / 11.4 FPS；
+- `output/m2_landforms_move_profile_optimized.json`：8x8 tile 与精简 descriptor，61.42 ms / 16.3 FPS；
+- `output/m2_landforms_move_profile_indexed.json`：批量邻接索引，45.82 ms / 21.8 FPS；
+- `output/m2_landforms_move_profile_cadenced.json`：1/2 地形更新节奏，24.05 ms / 41.6 FPS。
+
+这些都是逐阶段强制同步的诊断数据，不应直接等同于窗口标题中的异步 Preview FPS。
+
 ## 指标解释
 
 - `terrain_dispatch_ms`：Python LOD、集合、邻接、可见性、操作表构建和 kernel 提交。
@@ -137,13 +150,12 @@ fixed high-overdraw threshold of 256 candidates per tile it switches to a
 triangle-fragment depth
 pass with an atomic sortable depth key and a single per-pixel G-buffer resolve.
 This keeps the low-overdraw path fast while avoiding an unbounded
-pixel-times-candidate loop as terrain density increases. The triangle path is
-also bounded by `MAX_TRIANGLES_PER_TILE` and reports tile overflow as before.
-`tools/profile_m2.py` now reports active slots, compact clipped-triangle count,
-emitted tile-pair count and maximum tile candidates so the capacity reduction
-can be checked directly.
-The high-overdraw path consumes a dense tile/triangle-pair stream, so it does
-not scan the unused tail of every tile's fixed lookup capacity.
+pixel-times-candidate loop as terrain density increases. The high-overdraw
+path now rasterizes compact triangle screen bounds directly and is not bounded
+by `MAX_TRIANGLES_PER_TILE`. If the low-overdraw path exceeds that limit, a
+GPU-only fallback recomputes affected tiles from the full triangle stream in
+the same frame. `tools/profile_m2.py` reports active slots, compact clipped
+triangle count, the true maximum tile candidates and overflow pressure.
 
 ### Threshold validation (2026-09-15)
 
@@ -163,7 +175,7 @@ reduced `terrain_dispatch_ms` to 1.83 ms stable and 4.12 ms moving. End-to-end
 means were 11.30 ms and 14.48 ms, with zero tile overflow. Run-to-run variance
 is expected on a desktop GPU, so these values are directional rather than a
 fixed FPS promise.
-The final dense tile-pair run measured 11.35 ms stable and 14.39 ms moving,
+The former dense tile-pair run measured 11.35 ms stable and 14.39 ms moving,
 with 47,577 tile pairs in the stable frame and 19,251–48,901 while moving.
 The moving P99 was still 63.72 ms, including a 45.86 ms P99
 `terrain_upload_dispatch_ms`; this remaining long tail is outside the GPU

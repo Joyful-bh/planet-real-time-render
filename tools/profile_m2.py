@@ -26,7 +26,8 @@ from planet_renderer.cli import initial_state  # noqa: E402
 from planet_renderer.config import load_config  # noqa: E402
 from planet_renderer.renderer import PlanetRenderer  # noqa: E402
 from planet_renderer.terrain import CubeSphereTerrain  # noqa: E402
-from planet_renderer.terrain import ProceduralHeightProvider, TerrainSettings
+from planet_renderer.terrain import TerrainSettings
+from planet_renderer.terrain_factory import create_terrain_model  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +50,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--frames", type=int, default=120)
     parser.add_argument("--movement-step-m", type=float, default=25.0)
+    parser.add_argument(
+        "--terrain-update-interval-frames",
+        type=int,
+        help="Override the preview terrain cadence; defaults to the config value",
+    )
+    parser.add_argument(
+        "--altitude-m",
+        type=float,
+        help="Set the initial radial altitude for a targeted flight profile",
+    )
     parser.add_argument(
         "--width", type=int, help="Override render width for scaling experiments"
     )
@@ -95,20 +106,28 @@ def make_scene(args: argparse.Namespace):
         cache_capacity=config.terrain_cache_capacity,
     )
     terrain = CubeSphereTerrain(
-        planet, ProceduralHeightProvider(config.terrain_seed), settings
+        planet,
+        create_terrain_model(config.terrain),
+        settings,
     )
     direction = camera.position_global / np.linalg.norm(camera.position_global)
     terrain_height = terrain.describe_surface(direction).height_m
     camera.position_global = planet.surface_position(
         direction, terrain_height + max(config.initial_altitude_m, 2.0)
     )
+    if args.altitude_m is not None:
+        camera.position_global = planet.surface_position(
+            direction, max(args.altitude_m, 2.0)
+        )
     width, height = args.width or config.width, args.height or config.height
     renderer = PlanetRenderer(
         width,
         height,
+        terrain.height_model,
+        config.atmosphere,
+        config.postprocess,
         settings.max_gpu_patches,
         settings.patch_resolution,
-        terrain.height_provider,
     )
     return config, planet, camera, lighting, terrain, renderer
 
@@ -122,34 +141,42 @@ def execute_frame(
     renderer,
     simulated_time: float,
     movement_m: float,
+    update_terrain: bool = True,
 ) -> dict[str, float]:
     if movement_m:
         camera.move_local(planet, movement_m, 0.0, 0.0)
     ti.sync()
     frame_start = time.perf_counter()
     start = frame_start
-    terrain_frame = terrain.update(
-        camera,
-        renderer.width,
-        renderer.height,
-        now=simulated_time,
-    )
+    terrain_frame = None
+    if update_terrain:
+        terrain_frame = terrain.update(
+            camera,
+            renderer.width,
+            renderer.height,
+            now=simulated_time,
+        )
     terrain_dispatch_ms = (time.perf_counter() - start) * 1000.0
     start = time.perf_counter()
-    renderer.apply_terrain_frame(terrain_frame)
+    if terrain_frame is not None:
+        renderer.apply_terrain_frame(terrain_frame)
     terrain_upload_dispatch_ms = (time.perf_counter() - start) * 1000.0
     start = time.perf_counter()
     ti.sync()
     terrain_gpu_ms = (time.perf_counter() - start) * 1000.0
     start = time.perf_counter()
     renderer.render(
-        planet, camera, lighting.snapshot(), config.surface_albedo, config.exposure_ev
+        planet,
+        camera,
+        lighting.snapshot(),
+        config.surface_albedo,
+        config.postprocess.exposure_ev,
     )
     render_dispatch_ms = (time.perf_counter() - start) * 1000.0
     start = time.perf_counter()
     ti.sync()
     render_gpu_ms = (time.perf_counter() - start) * 1000.0
-    stats = terrain_frame.stats
+    stats = terrain.tile_manager.stats
     return {
         "frame_ms": (time.perf_counter() - frame_start) * 1000.0,
         "terrain_dispatch_ms": terrain_dispatch_ms,
@@ -166,11 +193,8 @@ def execute_frame(
         "clipped_triangles": float(
             min(renderer.clipped_count[None], renderer.raster_capacity)
         ),
-        "max_tile_candidates": float(renderer.max_tile_candidates[None]),
-        "tile_pairs": float(
-            min(renderer.tile_pair_count[None], renderer.tile_pair_capacity)
-        ),
-        "tile_overflow": float(renderer.tile_overflow[None]),
+        "max_tile_candidates": float(renderer.last_max_tile_candidates),
+        "tile_overflow": float(renderer.last_tile_overflow),
     }
 
 
@@ -206,7 +230,11 @@ def run_scenario(name: str, args: argparse.Namespace, scene) -> dict[str, object
     python_profiler = cProfile.Profile() if args.python_profile else None
     if python_profiler is not None:
         python_profiler.enable()
-    for _ in range(max(args.frames, 1)):
+    update_interval = (
+        args.terrain_update_interval_frames
+        or config.terrain_update_interval_frames
+    )
+    for frame_index in range(max(args.frames, 1)):
         simulated_time += 1.0 / 60.0
         rows.append(
             execute_frame(
@@ -218,6 +246,7 @@ def run_scenario(name: str, args: argparse.Namespace, scene) -> dict[str, object
                 renderer,
                 simulated_time,
                 movement,
+                update_terrain=frame_index % update_interval == 0,
             )
         )
     if python_profiler is not None:
@@ -247,7 +276,6 @@ def run_scenario(name: str, args: argparse.Namespace, scene) -> dict[str, object
         "active_slots",
         "clipped_triangles",
         "max_tile_candidates",
-        "tile_pairs",
         "tile_overflow",
     ):
         result[key] = {
@@ -277,6 +305,10 @@ def main() -> int:
         or args.warmup_frames < 1
         or args.settle_max_frames < 1
         or args.movement_step_m < 0.0
+        or (
+            args.terrain_update_interval_frames is not None
+            and args.terrain_update_interval_frames < 1
+        )
     ):
         raise ValueError(
             "frames/warmup must be positive and movement-step-m must be non-negative"

@@ -12,25 +12,27 @@ from dataclasses import dataclass
 import numpy as np
 import taichi as ti
 
+from .atmosphere import (
+    AtmosphereConfig,
+    AtmosphereDiagnosticView,
+    AtmosphereRenderer,
+)
 from .camera import PlanetCamera
-from .height import HeightProvider
+from .height import TerrainHeightModel
 from .lighting import LightingState
 from .planet import PlanetModel
-from .postprocess import display_transform
+from .postprocess import PostprocessConfig, PostProcessor
 from .terrain_lod import cube_face_direction
 from .terrain_renderer import TerrainRenderer
 from .terrain_types import PatchKey, TerrainFrame, TerrainPatchRenderDescriptor
 
-TILE_SIZE = 16
+TILE_SIZE = 8
 MAX_TRIANGLES_PER_TILE = 512
 MAX_CLIP_VERTICES = 8
 MAX_CLIPPED_TRIANGLES = 6
 DEPTH_KEY_Q_BITS = 32
 DEPTH_KEY_Q_MASK = (1 << DEPTH_KEY_Q_BITS) - 1
 DEPTH_KEY_SENTINEL = (1 << 64) - 1
-# The atomic depth path has a higher launch/atomic cost than the direct
-# candidate loop on the current tile sizes.  Keep it for genuinely dense
-# tiles only; ordinary terrain should stay on the low-overdraw path.
 TRIANGLE_RASTER_THRESHOLD = 256
 RASTER_PROBE_INTERVAL = 60
 
@@ -104,28 +106,40 @@ class PlanetRenderer:
         self,
         width: int,
         height: int,
+        height_model: TerrainHeightModel,
+        atmosphere_config: AtmosphereConfig,
+        postprocess_config: PostprocessConfig,
         max_patches: int = 256,
         patch_resolution: int = 12,
-        height_provider: HeightProvider | None = None,
     ):
         self.width, self.height = width, height
         self.max_patches = max_patches
         self.resolution = patch_resolution
         self.side = patch_resolution + 1
+        self._edge_indices = tuple(
+            self._surface_edge_indices(edge) for edge in range(4)
+        )
         self.surface_vertices = self.side * self.side
         self.vertices_per_patch = self.surface_vertices + 4 * self.side
         topology = _shared_topology(patch_resolution)
         self.local_triangle_count = len(topology)
         self.surface_triangle_count = patch_resolution * patch_resolution * 2
-        self.tiles_x = (width + 15) // 16
-        self.tiles_y = (height + 15) // 16
+        self.tiles_x = (width + TILE_SIZE - 1) // TILE_SIZE
+        self.tiles_y = (height + TILE_SIZE - 1) // TILE_SIZE
         self.patch_count = 0
         self.debug_view = 0
+        self.atmosphere_diagnostic_view = AtmosphereDiagnosticView.COMPOSITE
         self.terrain_renderer = TerrainRenderer(
+            height_model=height_model,
             max_patches=max_patches,
             patch_resolution=patch_resolution,
-            height_provider=height_provider,
         )
+        self.atmosphere_renderer = AtmosphereRenderer(
+            width,
+            height,
+            atmosphere_config,
+        )
+        self.postprocessor = PostProcessor(width, height, postprocess_config)
         self.local_triangles = ti.Vector.field(
             3, ti.i32, shape=self.local_triangle_count
         )
@@ -151,16 +165,26 @@ class PlanetRenderer:
         self.max_weld_operations = max_patches * 4 * self.side
         self.max_stitch_operations = max_patches * 4 * ((patch_resolution + 1) // 2)
         self.weld_count = ti.field(ti.i32, shape=())
-        self.weld_dst = ti.Vector.field(2, ti.i32, shape=self.max_weld_operations)
-        self.weld_src = ti.Vector.field(2, ti.i32, shape=self.max_weld_operations)
         self.stitch_count = ti.field(ti.i32, shape=())
-        self.stitch_vertex = ti.Vector.field(
+        self.edge_operations = ti.Vector.field(
             4, ti.i32, shape=self.max_stitch_operations
+            + self.max_weld_operations
         )
+        self._edge_vertex_cache: dict[PatchKey, np.ndarray] = {}
         self.anchor_relative = ti.Vector.field(3, ti.f32, shape=max_patches)
         self.view = ti.Vector.field(
             3, ti.f32, shape=(max_patches, self.vertices_per_patch)
         )
+        # Edge welding and mixed-LOD stitching are frame-local render
+        # operations.  Never apply them to TerrainRenderer's resident source
+        # data: that data survives render-set changes and must remain exactly
+        # as generated for the patch.  These fields form the mutable attribute
+        # stream consumed by clipping and rasterization for the current frame.
+        frame_shape = (max_patches, self.vertices_per_patch)
+        self.frame_normal = ti.Vector.field(3, ti.f32, shape=frame_shape)
+        self.frame_material = ti.Vector.field(4, ti.f32, shape=frame_shape)
+        self.frame_height_m = ti.field(ti.f32, shape=frame_shape)
+        self.frame_cell = ti.field(ti.i32, shape=frame_shape)
         raster_capacity = (
             max_patches * self.local_triangle_count * MAX_CLIPPED_TRIANGLES
         )
@@ -173,23 +197,18 @@ class PlanetRenderer:
         self.rc = ti.field(ti.i32, shape=rs)
         self.screen = ti.Vector.field(3, ti.f32, shape=rs)
         self.source = ti.field(ti.i32, shape=raster_capacity)
-        self.valid = ti.field(ti.i32, shape=raster_capacity)
-        # Clipped triangles are appended densely.  ``valid`` remains as a
-        # diagnostic field, while the render path uses this count directly.
+        # Per-triangle screen-space setup.  Edge equations are computed once
+        # when the triangle is emitted instead of once per pixel/candidate.
+        self.edge_equation = ti.Vector.field(
+            3, ti.f32, shape=(raster_capacity, 3)
+        )
+        self.inv_area = ti.field(ti.f32, shape=raster_capacity)
+        self.edge_top_left = ti.Vector.field(3, ti.i32, shape=raster_capacity)
         self.clipped_count = ti.field(ti.i32, shape=())
         self.tile_counts = ti.field(ti.i32, shape=(self.tiles_x, self.tiles_y))
         self.tile_triangles = ti.field(
             ti.i32, shape=(self.tiles_x, self.tiles_y, MAX_TRIANGLES_PER_TILE)
         )
-        # High-overdraw rasterization consumes a dense stream of tile/triangle
-        # pairs.  Keeping this separate from the tile-major lookup table lets
-        # it dispatch only emitted pairs instead of scanning each tile's full
-        # 512-entry capacity.
-        self.tile_pair_capacity = (
-            self.tiles_x * self.tiles_y * MAX_TRIANGLES_PER_TILE
-        )
-        self.tile_pair_count = ti.field(ti.i32, shape=())
-        self.tile_pairs = ti.field(ti.u64, shape=self.tile_pair_capacity)
         self.tile_overflow = ti.field(ti.i32, shape=())
         self.max_tile_candidates = ti.field(ti.i32, shape=())
         # The depth pass stores a sortable (positive-float-depth, triangle-id)
@@ -206,6 +225,7 @@ class PlanetRenderer:
         self.gbuffer_height_m = ti.field(ti.f32, shape=shape)
         self.gbuffer_surface_id = ti.field(ti.i32, shape=shape)
         self.gbuffer_surface_cell_id = ti.field(ti.i32, shape=shape)
+        self.surface_hdr = ti.Vector.field(3, ti.f32, shape=shape)
         self.hdr = ti.Vector.field(3, ti.f32, shape=shape)
         self.display = ti.Vector.field(3, ti.f32, shape=shape)
         self._render_descriptors: tuple[TerrainPatchRenderDescriptor, ...] = ()
@@ -214,6 +234,13 @@ class PlanetRenderer:
         self._render_signature: tuple | None = None
         self._raster_probe_frame = 0
         self._use_triangle_raster = False
+        self.last_max_tile_candidates = 0
+        self.last_tile_overflow = 0
+        self._active_host = np.zeros(max_patches, np.int32)
+        self._skirt_masks_host = np.zeros(max_patches, np.int32)
+        self._stitch_masks_host = np.zeros(max_patches, np.int32)
+        self._active_ids_host = np.zeros(max_patches, np.int32)
+        self._anchors_host = np.zeros((max_patches, 3), np.float32)
 
     def _surface_edge_indices(self, edge: int) -> tuple[int, ...]:
         n = self.resolution
@@ -246,23 +273,39 @@ class PlanetRenderer:
         # allocation-free identity shared by levels and cube faces.
         return raw[0] // divisor, raw[1] // divisor, raw[2] // divisor
 
+    def _patch_edge_vertices(
+        self,
+        key: PatchKey,
+    ) -> np.ndarray:
+        cached = self._edge_vertex_cache.get(key)
+        if cached is not None:
+            return cached
+        entries = np.asarray(
+            [(*self._vertex_direction_key(key, index), index)
+            for indices in self._edge_indices
+            for index in indices],
+            dtype=np.int64,
+        )
+        entries = np.unique(entries, axis=0)
+        self._edge_vertex_cache[key] = entries
+        return entries
+
     def _build_edge_operations(
         self,
         descriptors: list[TerrainPatchRenderDescriptor],
         slots: dict[PatchKey, int | None],
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        groups: dict[tuple[int, int, int], set[tuple[int, int]]] = {}
+        edge_rows: list[tuple[np.ndarray, int]] = []
+        row_count = 0
         stitch: list[tuple[int, int, int, int]] = []
         for descriptor in descriptors:
             slot = slots.get(descriptor.key)
             if slot is None:
                 continue
-            for edge in range(4):
-                indices = self._surface_edge_indices(edge)
-                for index in indices:
-                    groups.setdefault(
-                        self._vertex_direction_key(descriptor.key, index), set()
-                    ).add((int(slot), index))
+            cached = self._patch_edge_vertices(descriptor.key)
+            edge_rows.append((cached, int(slot)))
+            row_count += len(cached)
+            for edge, indices in enumerate(self._edge_indices):
                 if descriptor.stitch_mask & (1 << edge):
                     for position in range(1, self.resolution, 2):
                         stitch.append(
@@ -273,42 +316,58 @@ class PlanetRenderer:
                                 indices[position + 1],
                             )
                         )
-        destinations: list[tuple[int, int]] = []
-        sources: list[tuple[int, int]] = []
-        for vertices in groups.values():
-            if len(vertices) < 2:
-                continue
-            owner = min(vertices)
-            for vertex in sorted(vertices):
-                if vertex != owner:
-                    destinations.append(vertex)
-                    sources.append(owner)
+        destinations = np.empty((0, 2), np.int32)
+        sources = np.empty((0, 2), np.int32)
+        if edge_rows:
+            rows = np.empty((row_count, 5), np.int64)
+            offset = 0
+            for cached, slot in edge_rows:
+                end = offset + len(cached)
+                rows[offset:end, :3] = cached[:, :3]
+                rows[offset:end, 3] = slot
+                rows[offset:end, 4] = cached[:, 3]
+                offset = end
+            order = np.lexsort(
+                (rows[:, 4], rows[:, 3], rows[:, 2], rows[:, 1], rows[:, 0])
+            )
+            rows = rows[order]
+            repeated = np.all(rows[1:, :3] == rows[:-1, :3], axis=1)
+            if np.any(repeated):
+                row_indices = np.arange(len(rows), dtype=np.int64)
+                group_start = np.maximum.accumulate(
+                    np.where(
+                        np.concatenate(([True], ~repeated)),
+                        row_indices,
+                        0,
+                    )
+                )
+                destination_rows = rows[1:][repeated]
+                source_rows = rows[group_start[1:][repeated]]
+                destinations = destination_rows[:, 3:5].astype(np.int32)
+                sources = source_rows[:, 3:5].astype(np.int32)
         if (
             len(destinations) > self.max_weld_operations
             or len(stitch) > self.max_stitch_operations
         ):
             raise RuntimeError("Patch edge operation capacity exceeded")
         return (
-            np.asarray(destinations, np.int32).reshape((-1, 2)),
-            np.asarray(sources, np.int32).reshape((-1, 2)),
+            destinations,
+            sources,
             np.asarray(stitch, np.int32).reshape((-1, 4)),
         )
 
     @ti.kernel
     def _set_edge_operations(
         self,
-        dst: ti.types.ndarray(dtype=ti.i32, ndim=2),
-        src: ti.types.ndarray(dtype=ti.i32, ndim=2),
-        stitch: ti.types.ndarray(dtype=ti.i32, ndim=2),
+        weld_count: ti.i32,
+        stitch_count: ti.i32,
+        operations: ti.types.ndarray(dtype=ti.i32, ndim=2),
     ):
-        self.weld_count[None] = dst.shape[0]
-        self.stitch_count[None] = stitch.shape[0]
-        for i in range(dst.shape[0]):
-            self.weld_dst[i] = ti.Vector([dst[i, 0], dst[i, 1]])
-            self.weld_src[i] = ti.Vector([src[i, 0], src[i, 1]])
-        for i in range(stitch.shape[0]):
-            self.stitch_vertex[i] = ti.Vector(
-                [stitch[i, 0], stitch[i, 1], stitch[i, 2], stitch[i, 3]]
+        self.weld_count[None] = weld_count
+        self.stitch_count[None] = stitch_count
+        for i in range(weld_count + stitch_count):
+            self.edge_operations[i] = ti.Vector(
+                [operations[i, 0], operations[i, 1], operations[i, 2], operations[i, 3]]
             )
 
     def apply_terrain_frame(self, frame: TerrainFrame) -> None:
@@ -322,8 +381,10 @@ class PlanetRenderer:
         for release in frame.releases:
             self.terrain_renderer.release_patch(release.slot)
             self._release_render_slot(release.slot)
-        for upload in frame.uploads:
-            self.terrain_renderer.upload_patch(upload.slot, upload.descriptor)
+        # Batch all patch uploads into a small fixed number of GPU launches.
+        # This matters most while moving, when several new LOD patches can be
+        # scheduled in the same frame.
+        self.terrain_renderer.upload_patches(frame.uploads)
         self._set_render_patches(list(frame.render), dict(frame.render_slots))
 
     @ti.kernel
@@ -352,15 +413,12 @@ class PlanetRenderer:
         if render_signature == self._render_signature:
             self.patch_count = len(render_signature)
             return
-        active = np.zeros(self.max_patches, np.int32)
-        skirt_masks = np.zeros(
-            self.max_patches,
-            np.int32,
-        )
-        stitch_masks = np.zeros(
-            self.max_patches,
-            np.int32,
-        )
+        active = self._active_host
+        skirt_masks = self._skirt_masks_host
+        stitch_masks = self._stitch_masks_host
+        active.fill(0)
+        skirt_masks.fill(0)
+        stitch_masks.fill(0)
         for descriptor in descriptors:
             slot = slots.get(descriptor.key)
             if slot is not None:
@@ -376,15 +434,24 @@ class PlanetRenderer:
         )
         if edge_signature != self._edge_signature:
             weld_dst, weld_src, stitch = self._build_edge_operations(descriptors, slots)
-            self._set_edge_operations(weld_dst, weld_src, stitch)
+            weld_count = len(weld_dst)
+            stitch_count = len(stitch)
+            operations = np.empty((weld_count + stitch_count, 4), np.int32)
+            operations[:weld_count, :2] = weld_dst
+            operations[:weld_count, 2:] = weld_src
+            operations[weld_count:] = stitch
+            self._set_edge_operations(
+                weld_count,
+                stitch_count,
+                operations,
+            )
             self._edge_signature = edge_signature
         self._render_signature = render_signature
         self.patch_count = int(active.sum())
-        active_ids = np.zeros(self.max_patches, np.int32)
-        active_count = 0
-        for slot in np.flatnonzero(active):
-            active_ids[active_count] = int(slot)
-            active_count += 1
+        active_ids = self._active_ids_host
+        active_slots = np.flatnonzero(active)
+        active_count = len(active_slots)
+        active_ids[:active_count] = active_slots
         self._set_render(
             active,
             skirt_masks,
@@ -411,33 +478,9 @@ class PlanetRenderer:
             self.active_slot_ids[i] = active_ids[i]
 
     @ti.kernel
-    def _set_anchors(self, a: ti.types.ndarray(dtype=ti.f32, ndim=2)):
-        for i in range(self.active_slot_count[None]):
-            slot = self.active_slot_ids[i]
-            self.anchor_relative[slot] = ti.Vector(
-                [a[slot, 0], a[slot, 1], a[slot, 2]]
-            )
-
-    @ti.kernel
-    def _clear(self):
-        previous_count = ti.min(self.clipped_count[None], self.raster_capacity)
-        for i in range(previous_count):
-            self.valid[i] = 0
-        self.clipped_count[None] = 0
-        self.tile_pair_count[None] = 0
-        self.tile_overflow[None] = 0
-        self.max_tile_candidates[None] = 0
-        for q in ti.grouped(self.tile_counts):
-            self.tile_counts[q] = 0
-        for q in ti.grouped(self.depth):
-            self.depth[q] = 1e30
-            self.depth_key[q] = ti.u64(DEPTH_KEY_SENTINEL)
-            self.gbuffer_surface_id[q] = -1
-            self.gbuffer_surface_cell_id[q] = -1
-
-    @ti.kernel
-    def _transform(
+    def _prepare_frame(
         self,
+        anchors: ti.types.ndarray(dtype=ti.f32, ndim=2),
         e: ti.types.vector(3, ti.f32),
         u: ti.types.vector(3, ti.f32),
         n: ti.types.vector(3, ti.f32),
@@ -445,6 +488,25 @@ class PlanetRenderer:
         vu: ti.types.vector(3, ti.f32),
         f: ti.types.vector(3, ti.f32),
     ):
+        self.clipped_count[None] = 0
+        self.tile_overflow[None] = 0
+        self.max_tile_candidates[None] = 0
+        for i in range(self.active_slot_count[None]):
+            slot = self.active_slot_ids[i]
+            self.anchor_relative[slot] = ti.Vector(
+                [anchors[slot, 0], anchors[slot, 1], anchors[slot, 2]]
+            )
+        for q in ti.grouped(self.tile_counts):
+            self.tile_counts[q] = 0
+        # Stale G-buffer data is ignored whenever surface_id is -1, so there
+        # is no reason to clear all large attribute buffers every frame.
+        # Both the direct path and the same-frame overflow fallback use this
+        # atomic depth buffer. Clearing it here avoids a CPU synchronization
+        # merely to discover an overflowing tile later in the frame.
+        for q in ti.grouped(self.gbuffer_surface_id):
+            self.gbuffer_surface_id[q] = -1
+            self.gbuffer_surface_cell_id[q] = -1
+            self.depth_key[q] = ti.u64(DEPTH_KEY_SENTINEL)
         vertex_count = self.active_slot_count[None] * self.vertices_per_patch
         for active_vertex in range(vertex_count):
             active_index = active_vertex // self.vertices_per_patch
@@ -455,47 +517,87 @@ class PlanetRenderer:
             self.view[slot, index] = ti.Vector(
                 [local.dot(r), local.dot(vu), local.dot(f)]
             )
+            self.frame_normal[slot, index] = self.terrain_renderer.normal[
+                slot, index
+            ]
+            self.frame_material[slot, index] = self.terrain_renderer.material[
+                slot, index
+            ]
+            self.frame_height_m[slot, index] = self.terrain_renderer.height_m[
+                slot, index
+            ]
+            self.frame_cell[slot, index] = self.terrain_renderer.cell[slot, index]
 
     @ti.kernel
-    def _weld_edges(self):
+    def _fix_patch_edges(self):
+        """Weld current-frame attributes, then stitch mixed-LOD fine edges.
+
+        Position equality alone only provides C0 continuity.  Lighting also
+        requires a common normal at every shared vertex.  Each weld group has
+        one source and one or more destinations, so the serial accumulation
+        below forms one normal from all incident patch estimates before that
+        result is copied back to the complete group.
+        """
+
         for operation in range(self.weld_count[None]):
-            dst = self.weld_dst[operation]
-            src = self.weld_src[operation]
+            item = self.edge_operations[operation]
+            dst = ti.Vector([item.x, item.y])
+            src = ti.Vector([item.z, item.w])
             self.view[dst.x, dst.y] = self.view[src.x, src.y]
-            self.terrain_renderer.normal[dst.x, dst.y] = self.terrain_renderer.normal[
-                src.x, src.y
-            ]
-            self.terrain_renderer.height_m[dst.x, dst.y] = (
-                self.terrain_renderer.height_m[src.x, src.y]
-            )
-            self.terrain_renderer.material[dst.x, dst.y] = (
-                self.terrain_renderer.material[src.x, src.y]
-            )
-            self.terrain_renderer.cell[dst.x, dst.y] = self.terrain_renderer.cell[
-                src.x, src.y
-            ]
+            self.frame_height_m[dst.x, dst.y] = self.frame_height_m[src.x, src.y]
+            self.frame_material[dst.x, dst.y] = self.frame_material[src.x, src.y]
+            self.frame_cell[dst.x, dst.y] = self.frame_cell[src.x, src.y]
 
-    @ti.kernel
-    def _stitch_lod_edges(self):
+        # A cube corner can be shared by more than two patches.  Serialize the
+        # small edge-only reduction so all incident normals contribute to the
+        # same source without a write race.  The generated patch attributes are
+        # restored into frame_normal by _prepare_frame on every frame.
+        ti.loop_config(serialize=True)
+        for operation in range(self.weld_count[None]):
+            item = self.edge_operations[operation]
+            dst = ti.Vector([item.x, item.y])
+            src = ti.Vector([item.z, item.w])
+            self.frame_normal[src.x, src.y] += self.frame_normal[dst.x, dst.y]
+
+        for operation in range(self.weld_count[None]):
+            item = self.edge_operations[operation]
+            dst = ti.Vector([item.x, item.y])
+            src = ti.Vector([item.z, item.w])
+            normal_sum = self.frame_normal[src.x, src.y]
+            shared_normal = normal_sum / ti.max(normal_sum.norm(), 1.0e-8)
+            self.frame_normal[src.x, src.y] = shared_normal
+            self.frame_normal[dst.x, dst.y] = shared_normal
+
         for operation in range(self.stitch_count[None]):
-            item = self.stitch_vertex[operation]
+            item = self.edge_operations[self.weld_count[None] + operation]
             slot = item.x
             vertex = item.y
             a = item.z
             b = item.w
             self.view[slot, vertex] = (self.view[slot, a] + self.view[slot, b]) * 0.5
-            self.terrain_renderer.normal[slot, vertex] = (
-                self.terrain_renderer.normal[slot, a]
-                + self.terrain_renderer.normal[slot, b]
+            self.frame_normal[slot, vertex] = (
+                self.frame_normal[slot, a]
+                + self.frame_normal[slot, b]
             ).normalized()
-            self.terrain_renderer.height_m[slot, vertex] = (
-                self.terrain_renderer.height_m[slot, a]
-                + self.terrain_renderer.height_m[slot, b]
+            self.frame_height_m[slot, vertex] = (
+                self.frame_height_m[slot, a]
+                + self.frame_height_m[slot, b]
             ) * 0.5
-            self.terrain_renderer.material[slot, vertex] = (
-                self.terrain_renderer.material[slot, a]
-                + self.terrain_renderer.material[slot, b]
+            self.frame_material[slot, vertex] = (
+                self.frame_material[slot, a]
+                + self.frame_material[slot, b]
             ) * 0.5
+
+    @ti.func
+    def _edge_coeff(self, a: ti.template(), b: ti.template()):
+        # edge(a,b,p) = A*p.x + B*p.y + C
+        return ti.Vector(
+            [
+                a.y - b.y,
+                b.x - a.x,
+                (b.y - a.y) * a.x - (b.x - a.x) * a.y,
+            ]
+        )
 
     @ti.func
     def _emit(
@@ -509,11 +611,12 @@ class PlanetRenderer:
         tf: ti.f32,
     ):
         # Every source triangle can produce zero to six clipped triangles.
-        # Atomically append each emitted triangle so the following bin pass
-        # sees a dense list rather than scanning the fixed-capacity holes.
+        # Atomically append each emitted triangle so following passes iterate
+        # a dense stream rather than the theoretical capacity.
         s = ti.atomic_add(self.clipped_count[None], 1)
         if s < self.raster_capacity:
             aspect = ti.cast(self.width, ti.f32) / self.height
+            sp = ti.Matrix.zero(ti.f32, 3, 3)
             for k in ti.static(range(3)):
                 p = v[k, :]
                 self.rv[s, k] = p
@@ -528,9 +631,35 @@ class PlanetRenderer:
                     ]
                 )
                 projected = ti.floor(projected * 256.0 + 0.5) / 256.0
+                sp[k, 0] = projected.x
+                sp[k, 1] = projected.y
+                sp[k, 2] = p.z
                 self.screen[s, k] = ti.Vector([projected.x, projected.y, p.z])
+
+            a = ti.Vector([sp[0, 0], sp[0, 1]])
+            b = ti.Vector([sp[1, 0], sp[1, 1]])
+            cc = ti.Vector([sp[2, 0], sp[2, 1]])
+            area = self._edge(a, b, cc)
+            abs_area = ti.abs(area)
+            sg = 1.0 if area > 0.0 else -1.0
+            self.inv_area[s] = 0.0
+            if abs_area > 1e-8:
+                self.inv_area[s] = 1.0 / abs_area
+
+            eq0 = self._edge_coeff(b, cc) * sg
+            eq1 = self._edge_coeff(cc, a) * sg
+            eq2 = self._edge_coeff(a, b) * sg
+            self.edge_equation[s, 0] = eq0
+            self.edge_equation[s, 1] = eq1
+            self.edge_equation[s, 2] = eq2
+            self.edge_top_left[s] = ti.Vector(
+                [
+                    self._top_left(b, cc, sg),
+                    self._top_left(cc, a, sg),
+                    self._top_left(a, b, sg),
+                ]
+            )
             self.source[s] = src
-            self.valid[s] = 1
 
     @ti.func
     def _clip_distance(
@@ -552,6 +681,27 @@ class PlanetRenderer:
             distance = -p.y + p.z * tan_y
         return distance
 
+    @ti.func
+    def _clip_code(
+        self,
+        p: ti.template(),
+        near: ti.f32,
+        tan_x: ti.f32,
+        tan_y: ti.f32,
+    ) -> ti.i32:
+        code = 0
+        if p.z < near:
+            code = code | 1
+        if p.x < -p.z * tan_x:
+            code = code | 2
+        if p.x > p.z * tan_x:
+            code = code | 4
+        if p.y < -p.z * tan_y:
+            code = code | 8
+        if p.y > p.z * tan_y:
+            code = code | 16
+        return code
+
     @ti.kernel
     def _clip(self, near: ti.f32, tf: ti.f32):
         aspect = ti.cast(self.width, ti.f32) / self.height
@@ -570,127 +720,197 @@ class PlanetRenderer:
                 skirt_edge >= 0
                 and (self.slot_skirt_mask[slot] & (1 << skirt_edge)) != 0
             )
-            if self.slot_render[slot] and enabled:
-                ids = self.local_triangles[local_id]
-                positions = ti.Matrix.zero(ti.f32, MAX_CLIP_VERTICES * 2, 3)
-                normals = ti.Matrix.zero(ti.f32, MAX_CLIP_VERTICES * 2, 3)
-                materials = ti.Matrix.zero(ti.f32, MAX_CLIP_VERTICES * 2, 4)
-                heights = ti.Vector.zero(ti.f32, MAX_CLIP_VERTICES * 2)
-                cells = ti.Vector.zero(ti.i32, MAX_CLIP_VERTICES * 2)
-                for vertex in range(3):
-                    index = ids[vertex]
-                    positions[vertex, :] = self.view[slot, index]
-                    normals[vertex, :] = self.terrain_renderer.normal[slot, index]
-                    materials[vertex, :] = self.terrain_renderer.material[slot, index]
-                    heights[vertex] = self.terrain_renderer.height_m[slot, index]
-                    cells[vertex] = self.terrain_renderer.cell[slot, index]
-                front_facing = (positions[1, :] - positions[0, :]).cross(
-                    positions[2, :] - positions[0, :]
-                ).dot(-positions[0, :]) < 0.0
-                is_skirt = local_id >= self.surface_triangle_count
-                if not is_skirt and not front_facing:
-                    continue
-                count = 3
-                read_buffer = 0
-                for plane in range(5):
-                    write_buffer = 1 - read_buffer
-                    output_count = 0
-                    for vertex in range(MAX_CLIP_VERTICES):
-                        if vertex < count:
-                            previous = (vertex + count - 1) % count
-                            current_index = read_buffer * MAX_CLIP_VERTICES + vertex
-                            previous_index = read_buffer * MAX_CLIP_VERTICES + previous
-                            current_position = positions[current_index, :]
-                            previous_position = positions[previous_index, :]
-                            current_distance = self._clip_distance(
-                                current_position, plane, near, tan_x, tan_y
-                            )
-                            previous_distance = self._clip_distance(
-                                previous_position, plane, near, tan_x, tan_y
-                            )
-                            current_inside = current_distance >= 0.0
-                            previous_inside = previous_distance >= 0.0
-                            if (
-                                current_inside != previous_inside
-                                and output_count < MAX_CLIP_VERTICES
-                            ):
-                                denominator = previous_distance - current_distance
-                                t = (
-                                    previous_distance / denominator
-                                    if ti.abs(denominator) > 1e-20
-                                    else 0.0
-                                )
-                                destination = (
-                                    write_buffer * MAX_CLIP_VERTICES + output_count
-                                )
-                                positions[destination, :] = (
-                                    previous_position
-                                    + (current_position - previous_position) * t
-                                )
-                                normals[destination, :] = (
-                                    normals[previous_index, :]
-                                    + (
-                                        normals[current_index, :]
-                                        - normals[previous_index, :]
-                                    )
-                                    * t
-                                ).normalized()
-                                materials[destination, :] = (
-                                    materials[previous_index, :]
-                                    + (
-                                        materials[current_index, :]
-                                        - materials[previous_index, :]
-                                    )
-                                    * t
-                                )
-                                heights[destination] = (
-                                    heights[previous_index]
-                                    + (heights[current_index] - heights[previous_index])
-                                    * t
-                                )
-                                cells[destination] = (
-                                    cells[current_index]
-                                    if current_inside
-                                    else cells[previous_index]
-                                )
-                                output_count += 1
-                            if current_inside and output_count < MAX_CLIP_VERTICES:
-                                destination = (
-                                    write_buffer * MAX_CLIP_VERTICES + output_count
-                                )
-                                positions[destination, :] = current_position
-                                normals[destination, :] = normals[current_index, :]
-                                materials[destination, :] = materials[current_index, :]
-                                heights[destination] = heights[current_index]
-                                cells[destination] = cells[current_index]
-                                output_count += 1
-                    count = output_count
-                    read_buffer = write_buffer
-                for triangle in range(MAX_CLIPPED_TRIANGLES):
-                    if triangle < count - 2:
-                        a = read_buffer * MAX_CLIP_VERTICES
-                        b = a + triangle + 1
-                        c = a + triangle + 2
-                        self._emit(
-                            source_id,
-                            ti.Matrix.rows(
-                                [positions[a, :], positions[b, :], positions[c, :]]
-                            ),
-                            ti.Matrix.rows(
-                                [normals[a, :], normals[b, :], normals[c, :]]
-                            ),
-                            ti.Matrix.rows(
-                                [materials[a, :], materials[b, :], materials[c, :]]
-                            ),
-                            ti.Vector([heights[a], heights[b], heights[c]]),
-                            ti.Vector([cells[a], cells[b], cells[c]]),
-                            tf,
+            if not enabled:
+                continue
+
+            ids = self.local_triangles[local_id]
+            p0 = self.view[slot, ids[0]]
+            p1 = self.view[slot, ids[1]]
+            p2 = self.view[slot, ids[2]]
+
+            # Cull ordinary terrain backfaces before any clipping or attribute
+            # interpolation. Skirts remain double-sided as a crack safety net.
+            is_skirt = local_id >= self.surface_triangle_count
+            front_facing = (p1 - p0).cross(p2 - p0).dot(-p0) < 0.0
+            if not is_skirt and not front_facing:
+                continue
+
+            c0 = self._clip_code(p0, near, tan_x, tan_y)
+            c1 = self._clip_code(p1, near, tan_x, tan_y)
+            c2 = self._clip_code(p2, near, tan_x, tan_y)
+
+            # Cohen-Sutherland style trivial reject: all vertices lie outside
+            # the same frustum plane.
+            if (c0 & c1 & c2) != 0:
+                continue
+
+            n0 = self.frame_normal[slot, ids[0]]
+            n1 = self.frame_normal[slot, ids[1]]
+            n2 = self.frame_normal[slot, ids[2]]
+            m0 = self.frame_material[slot, ids[0]]
+            m1 = self.frame_material[slot, ids[1]]
+            m2 = self.frame_material[slot, ids[2]]
+            h0 = self.frame_height_m[slot, ids[0]]
+            h1 = self.frame_height_m[slot, ids[1]]
+            h2 = self.frame_height_m[slot, ids[2]]
+            cell0 = self.frame_cell[slot, ids[0]]
+            cell1 = self.frame_cell[slot, ids[1]]
+            cell2 = self.frame_cell[slot, ids[2]]
+
+            # The overwhelmingly common case is fully inside the frustum.
+            # Emit directly and completely bypass five-plane polygon clipping.
+            if (c0 | c1 | c2) == 0:
+                self._emit(
+                    source_id,
+                    ti.Matrix.rows([p0, p1, p2]),
+                    ti.Matrix.rows([n0, n1, n2]),
+                    ti.Matrix.rows([m0, m1, m2]),
+                    ti.Vector([h0, h1, h2]),
+                    ti.Vector([cell0, cell1, cell2]),
+                    tf,
+                )
+                continue
+
+            # Only boundary-crossing triangles pay for Sutherland-Hodgman.
+            positions = ti.Matrix.zero(ti.f32, MAX_CLIP_VERTICES * 2, 3)
+            normals = ti.Matrix.zero(ti.f32, MAX_CLIP_VERTICES * 2, 3)
+            materials = ti.Matrix.zero(ti.f32, MAX_CLIP_VERTICES * 2, 4)
+            heights = ti.Vector.zero(ti.f32, MAX_CLIP_VERTICES * 2)
+            cells = ti.Vector.zero(ti.i32, MAX_CLIP_VERTICES * 2)
+            positions[0, :] = p0
+            positions[1, :] = p1
+            positions[2, :] = p2
+            normals[0, :] = n0
+            normals[1, :] = n1
+            normals[2, :] = n2
+            materials[0, :] = m0
+            materials[1, :] = m1
+            materials[2, :] = m2
+            heights[0] = h0
+            heights[1] = h1
+            heights[2] = h2
+            cells[0] = cell0
+            cells[1] = cell1
+            cells[2] = cell2
+
+            count = 3
+            read_buffer = 0
+            for plane in range(5):
+                write_buffer = 1 - read_buffer
+                output_count = 0
+                for vertex in range(MAX_CLIP_VERTICES):
+                    if vertex < count:
+                        previous = (vertex + count - 1) % count
+                        current_index = read_buffer * MAX_CLIP_VERTICES + vertex
+                        previous_index = read_buffer * MAX_CLIP_VERTICES + previous
+                        current_position = positions[current_index, :]
+                        previous_position = positions[previous_index, :]
+                        current_distance = self._clip_distance(
+                            current_position, plane, near, tan_x, tan_y
                         )
+                        previous_distance = self._clip_distance(
+                            previous_position, plane, near, tan_x, tan_y
+                        )
+                        current_inside = current_distance >= 0.0
+                        previous_inside = previous_distance >= 0.0
+                        if (
+                            current_inside != previous_inside
+                            and output_count < MAX_CLIP_VERTICES
+                        ):
+                            denominator = previous_distance - current_distance
+                            t = (
+                                previous_distance / denominator
+                                if ti.abs(denominator) > 1e-20
+                                else 0.0
+                            )
+                            destination = write_buffer * MAX_CLIP_VERTICES + output_count
+                            positions[destination, :] = previous_position + (
+                                current_position - previous_position
+                            ) * t
+                            normals[destination, :] = (
+                                normals[previous_index, :]
+                                + (
+                                    normals[current_index, :]
+                                    - normals[previous_index, :]
+                                )
+                                * t
+                            ).normalized()
+                            materials[destination, :] = materials[previous_index, :] + (
+                                materials[current_index, :]
+                                - materials[previous_index, :]
+                            ) * t
+                            heights[destination] = heights[previous_index] + (
+                                heights[current_index] - heights[previous_index]
+                            ) * t
+                            cells[destination] = (
+                                cells[current_index]
+                                if current_inside
+                                else cells[previous_index]
+                            )
+                            output_count += 1
+                        if current_inside and output_count < MAX_CLIP_VERTICES:
+                            destination = write_buffer * MAX_CLIP_VERTICES + output_count
+                            positions[destination, :] = current_position
+                            normals[destination, :] = normals[current_index, :]
+                            materials[destination, :] = materials[current_index, :]
+                            heights[destination] = heights[current_index]
+                            cells[destination] = cells[current_index]
+                            output_count += 1
+                count = output_count
+                read_buffer = write_buffer
+
+            for triangle in range(MAX_CLIPPED_TRIANGLES):
+                if triangle < count - 2:
+                    a = read_buffer * MAX_CLIP_VERTICES
+                    b = a + triangle + 1
+                    c = a + triangle + 2
+                    self._emit(
+                        source_id,
+                        ti.Matrix.rows(
+                            [positions[a, :], positions[b, :], positions[c, :]]
+                        ),
+                        ti.Matrix.rows(
+                            [normals[a, :], normals[b, :], normals[c, :]]
+                        ),
+                        ti.Matrix.rows(
+                            [materials[a, :], materials[b, :], materials[c, :]]
+                        ),
+                        ti.Vector([heights[a], heights[b], heights[c]]),
+                        ti.Vector([cells[a], cells[b], cells[c]]),
+                        tf,
+                    )
+
+    @ti.func
+    def _triangle_overlaps_tile(
+        self,
+        q: ti.i32,
+        tile_x: ti.i32,
+        tile_y: ti.i32,
+    ) -> ti.i32:
+        """Conservative triangle/rectangle test using oriented edge planes."""
+
+        x0 = ti.cast(tile_x * TILE_SIZE, ti.f32)
+        y0 = ti.cast(tile_y * TILE_SIZE, ti.f32)
+        x1 = ti.cast(ti.min((tile_x + 1) * TILE_SIZE, self.width), ti.f32)
+        y1 = ti.cast(ti.min((tile_y + 1) * TILE_SIZE, self.height), ti.f32)
+        overlaps = 1
+        for edge in ti.static(range(3)):
+            eq = self.edge_equation[q, edge]
+            # Maximum edge value over an axis-aligned rectangle. If even that
+            # corner is outside, the whole tile lies outside this triangle edge.
+            px = x1 if eq.x >= 0.0 else x0
+            py = y1 if eq.y >= 0.0 else y0
+            maximum = eq.x * px + eq.y * py + eq.z
+            if maximum < 0.0:
+                overlaps = 0
+        return overlaps
 
     @ti.kernel
     def _bin(self):
         triangle_count = ti.min(self.clipped_count[None], self.raster_capacity)
         for q in range(triangle_count):
+            if self.inv_area[q] <= 0.0:
+                continue
             a, b, c = self.screen[q, 0], self.screen[q, 1], self.screen[q, 2]
             x0 = ti.max(ti.cast(ti.floor(ti.min(a.x, b.x, c.x)), ti.i32), 0)
             x1 = ti.min(
@@ -705,21 +925,16 @@ class PlanetRenderer:
                     (x0 // TILE_SIZE, x1 // TILE_SIZE + 1),
                     (y0 // TILE_SIZE, y1 // TILE_SIZE + 1),
                 ):
-                    k = ti.atomic_add(self.tile_counts[x, y], 1)
-                    ti.atomic_max(
-                        self.max_tile_candidates[None],
-                        ti.min(k + 1, MAX_TRIANGLES_PER_TILE),
-                    )
-                    if k < MAX_TRIANGLES_PER_TILE:
-                        self.tile_triangles[x, y, k] = q
-                        pair = ti.atomic_add(self.tile_pair_count[None], 1)
-                        if pair < self.tile_pair_capacity:
-                            tile_id = y * self.tiles_x + x
-                            self.tile_pairs[pair] = (
-                                ti.cast(tile_id, ti.u64) << 32
-                            ) | ti.cast(q, ti.u64)
-                    else:
-                        ti.atomic_add(self.tile_overflow[None], 1)
+                    if self._triangle_overlaps_tile(q, x, y) != 0:
+                        k = ti.atomic_add(self.tile_counts[x, y], 1)
+                        ti.atomic_max(
+                            self.max_tile_candidates[None],
+                            k + 1,
+                        )
+                        if k < MAX_TRIANGLES_PER_TILE:
+                            self.tile_triangles[x, y, k] = q
+                        else:
+                            ti.atomic_add(self.tile_overflow[None], 1)
 
     @ti.func
     def _edge(self, a: ti.template(), b: ti.template(), p: ti.template()) -> ti.f32:
@@ -766,9 +981,37 @@ class PlanetRenderer:
         return color
 
     @ti.func
-    def _debug_color(self, h: ti.f32, slot: ti.i32, mode: ti.i32):
-        color = self._height_band(h)
+    def _surface_color(
+        self,
+        h: ti.f32,
+        material: ti.template(),
+        slot: ti.i32,
+        mode: ti.i32,
+    ):
+        fertile = ti.Vector([0.10, 0.34, 0.075])
+        arid = ti.Vector([0.44, 0.31, 0.13])
+        rock = ti.Vector([0.34, 0.32, 0.30])
+        snow = ti.Vector([0.92, 0.95, 0.98])
+        sand = ti.Vector([0.72, 0.60, 0.34])
+        deep_ocean = ti.Vector([0.012, 0.055, 0.16])
+        shallow_ocean = ti.Vector([0.015, 0.34, 0.46])
+
+        color = (
+            fertile * material[0]
+            + arid * material[1]
+            + rock * material[2]
+            + snow * material[3]
+        )
+        if h < 0.0:
+            water_depth = ti.min(ti.max(-h / 4200.0, 0.0), 1.0)
+            color = shallow_ocean * (1.0 - water_depth) + deep_ocean * water_depth
+        elif h < 140.0:
+            coast = ti.min(ti.max(h / 140.0, 0.0), 1.0)
+            color = sand * (1.0 - coast) + color * coast
+
         if mode == 1:
+            color = self._height_band(h)
+        elif mode == 2:
             hue = ti.cast(self.terrain_renderer.slot_level[slot] % 6, ti.f32) / 6.0
             color = ti.Vector(
                 [
@@ -778,7 +1021,7 @@ class PlanetRenderer:
                 ]
             )
             color = ti.min(ti.max(color, 0.0), 1.0)
-        elif mode == 2:
+        elif mode == 3:
             value = ti.cast((slot * 1103515245 + 12345) & 255, ti.f32) / 255.0
             color = ti.Vector(
                 [
@@ -789,16 +1032,39 @@ class PlanetRenderer:
             )
         return color
 
+    @ti.func
+    def _edge_values(self, q: ti.i32, p: ti.template()):
+        e0 = self.edge_equation[q, 0]
+        e1 = self.edge_equation[q, 1]
+        e2 = self.edge_equation[q, 2]
+        return ti.Vector(
+            [
+                e0.x * p.x + e0.y * p.y + e0.z,
+                e1.x * p.x + e1.y * p.y + e1.z,
+                e2.x * p.x + e2.y * p.y + e2.z,
+            ]
+        )
+
+    @ti.func
+    def _inside_edges(self, q: ti.i32, e: ti.template()) -> ti.i32:
+        top_left = self.edge_top_left[q]
+        return ti.cast(
+            (e.x > 0.0 or (e.x == 0.0 and top_left.x != 0))
+            and (e.y > 0.0 or (e.y == 0.0 and top_left.y != 0))
+            and (e.z > 0.0 or (e.z == 0.0 and top_left.z != 0)),
+            ti.i32,
+        )
+
     @ti.kernel
     def _raster_pixel(self, mode: ti.i32):
-        """Fast path for low-overdraw tiles.
+        """Pixel-parallel path for low-overdraw tiles.
 
-        Pixels remain the parallel unit of work, while the compact tile list
-        bounds the candidate loop.  The adaptive dispatcher only selects this
-        path when tile overdraw is low; high-overdraw frames use the atomic
-        depth path below so candidate traversal does not multiply by pixels.
+        Triangle edge equations and inverse area are precomputed once in
+        ``_emit``.  The hot pixel/candidate loop is therefore reduced to three
+        fused linear evaluations plus perspective-depth work.
         """
-        for x, y in self.depth:
+
+        for x, y in self.gbuffer_surface_id:
             p = ti.Vector([ti.cast(x, ti.f32) + 0.5, ti.cast(y, ti.f32) + 0.5])
             best = 1e30
             src = -1
@@ -807,35 +1073,19 @@ class PlanetRenderer:
             bn = ti.Vector.zero(ti.f32, 3)
             bm = ti.Vector.zero(ti.f32, 4)
             bh = 0.0
+            tile_x = x // TILE_SIZE
+            tile_y = y // TILE_SIZE
             candidate_count = ti.min(
-                self.tile_counts[x // TILE_SIZE, y // TILE_SIZE],
-                MAX_TRIANGLES_PER_TILE,
+                self.tile_counts[tile_x, tile_y], MAX_TRIANGLES_PER_TILE
             )
             for k in range(candidate_count):
-                q = self.tile_triangles[x // TILE_SIZE, y // TILE_SIZE, k]
-                a, b, c = self.screen[q, 0], self.screen[q, 1], self.screen[q, 2]
-                area = self._edge(a.xy, b.xy, c.xy)
-                sg = 1.0 if area > 0 else -1.0
-                e = ti.Vector(
-                    [
-                        self._edge(b.xy, c.xy, p) * sg,
-                        self._edge(c.xy, a.xy, p) * sg,
-                        self._edge(a.xy, b.xy, p) * sg,
-                    ]
-                )
-                inside = (
-                    (e.x > 0.0 or (e.x == 0.0 and self._top_left(b.xy, c.xy, sg) != 0))
-                    and (
-                        e.y > 0.0
-                        or (e.y == 0.0 and self._top_left(c.xy, a.xy, sg) != 0)
-                    )
-                    and (
-                        e.z > 0.0
-                        or (e.z == 0.0 and self._top_left(a.xy, b.xy, sg) != 0)
-                    )
-                )
-                if ti.abs(area) > 1e-8 and inside:
-                    l = e / ti.abs(area)
+                q = self.tile_triangles[tile_x, tile_y, k]
+                e = self._edge_values(q, p)
+                if self._inside_edges(q, e) != 0:
+                    a = self.screen[q, 0]
+                    b = self.screen[q, 1]
+                    c = self.screen[q, 2]
+                    l = e * self.inv_area[q]
                     z = 1.0 / ti.max(l.x / a.z + l.y / b.z + l.z / c.z, 1e-20)
                     if z < best:
                         w = ti.Vector([l.x * z / a.z, l.y * z / b.z, l.z * z / c.z])
@@ -876,77 +1126,50 @@ class PlanetRenderer:
                 self.gbuffer_normal[x, y] = bn
                 self.gbuffer_material_weights[x, y] = bm
                 self.gbuffer_height_m[x, y] = bh
-                self.gbuffer_albedo[x, y] = self._debug_color(bh, slot, mode)
+                self.gbuffer_albedo[x, y] = self._surface_color(
+                    bh, bm, slot, mode
+                )
 
     @ti.kernel
-    def _raster_depth(self):
-        # Dispatch one independent work item per emitted tile/candidate pair.
-        # ``_bin`` compacts these pairs into ``tile_pairs`` so this pass does
-        # not scan the unused tail of every tile's fixed lookup capacity.
-        pair_count = ti.min(self.tile_pair_count[None], self.tile_pair_capacity)
-        for pair in range(pair_count):
-            packed = self.tile_pairs[pair]
-            tile_id = ti.cast(packed >> 32, ti.i32)
-            q = ti.cast(packed & ti.u64(0xFFFFFFFF), ti.i32)
-            tile_x = tile_id % self.tiles_x
-            tile_y = tile_id // self.tiles_x
+    def _raster_depth_direct(self, overflow_only: ti.template()):
+        """Rasterize triangle bounds without a fixed per-tile candidate cap.
+
+        The full variant is the high-overdraw path. The overflow-only variant
+        repairs tiles truncated by the bounded pixel path in the same frame.
+        """
+
+        triangle_count = ti.min(self.clipped_count[None], self.raster_capacity)
+        for q in range(triangle_count):
+            active = self.inv_area[q] > 0.0
+            if ti.static(overflow_only):
+                active = active and self.tile_overflow[None] > 0
+            if not active:
+                continue
+
             a, b, c = self.screen[q, 0], self.screen[q, 1], self.screen[q, 2]
-            area = self._edge(a.xy, b.xy, c.xy)
-            if ti.abs(area) > 1e-8:
-                sg = 1.0 if area > 0 else -1.0
-                tile_x0 = tile_x * TILE_SIZE
-                tile_y0 = tile_y * TILE_SIZE
-                tile_x1 = ti.min(tile_x0 + TILE_SIZE, self.width) - 1
-                tile_y1 = ti.min(tile_y0 + TILE_SIZE, self.height) - 1
-                x0 = ti.max(
-                    ti.cast(ti.floor(ti.min(a.x, b.x, c.x)), ti.i32), tile_x0
-                )
-                x1 = ti.min(
-                    ti.cast(ti.ceil(ti.max(a.x, b.x, c.x)), ti.i32), tile_x1
-                )
-                y0 = ti.max(
-                    ti.cast(ti.floor(ti.min(a.y, b.y, c.y)), ti.i32), tile_y0
-                )
-                y1 = ti.min(
-                    ti.cast(ti.ceil(ti.max(a.y, b.y, c.y)), ti.i32), tile_y1
-                )
-                if x0 <= x1 and y0 <= y1:
-                    for x, y in ti.ndrange((x0, x1 + 1), (y0, y1 + 1)):
+            x0 = ti.max(ti.cast(ti.floor(ti.min(a.x, b.x, c.x)), ti.i32), 0)
+            x1 = ti.min(
+                ti.cast(ti.ceil(ti.max(a.x, b.x, c.x)), ti.i32), self.width - 1
+            )
+            y0 = ti.max(ti.cast(ti.floor(ti.min(a.y, b.y, c.y)), ti.i32), 0)
+            y1 = ti.min(
+                ti.cast(ti.ceil(ti.max(a.y, b.y, c.y)), ti.i32), self.height - 1
+            )
+            if x0 <= x1 and y0 <= y1:
+                for x, y in ti.ndrange((x0, x1 + 1), (y0, y1 + 1)):
+                    rasterize = True
+                    if ti.static(overflow_only):
+                        rasterize = (
+                            self.tile_counts[x // TILE_SIZE, y // TILE_SIZE]
+                            > MAX_TRIANGLES_PER_TILE
+                        )
+                    if rasterize:
                         p = ti.Vector(
                             [ti.cast(x, ti.f32) + 0.5, ti.cast(y, ti.f32) + 0.5]
                         )
-                        e = ti.Vector(
-                            [
-                                self._edge(b.xy, c.xy, p) * sg,
-                                self._edge(c.xy, a.xy, p) * sg,
-                                self._edge(a.xy, b.xy, p) * sg,
-                            ]
-                        )
-                        inside = (
-                            (
-                                e.x > 0.0
-                                or (
-                                    e.x == 0.0
-                                    and self._top_left(b.xy, c.xy, sg) != 0
-                                )
-                            )
-                            and (
-                                e.y > 0.0
-                                or (
-                                    e.y == 0.0
-                                    and self._top_left(c.xy, a.xy, sg) != 0
-                                )
-                            )
-                            and (
-                                e.z > 0.0
-                                or (
-                                    e.z == 0.0
-                                    and self._top_left(a.xy, b.xy, sg) != 0
-                                )
-                            )
-                        )
-                        if inside:
-                            l = e / ti.abs(area)
+                        e = self._edge_values(q, p)
+                        if self._inside_edges(q, e) != 0:
+                            l = e * self.inv_area[q]
                             z = 1.0 / ti.max(
                                 l.x / a.z + l.y / b.z + l.z / c.z,
                                 1e-20,
@@ -958,27 +1181,25 @@ class PlanetRenderer:
                             ti.atomic_min(self.depth_key[x, y], key)
 
     @ti.kernel
-    def _resolve_raster(self, mode: ti.i32):
+    def _resolve_raster(self, mode: ti.i32, overflow_only: ti.template()):
         # Resolve the triangle selected by the atomic depth key.  This is one
         # interpolation per covered pixel instead of a second candidate scan.
         for x, y in self.depth:
             key = self.depth_key[x, y]
-            if key != ti.u64(DEPTH_KEY_SENTINEL):
+            resolve = key != ti.u64(DEPTH_KEY_SENTINEL)
+            if ti.static(overflow_only):
+                resolve = resolve and (
+                    self.tile_counts[x // TILE_SIZE, y // TILE_SIZE]
+                    > MAX_TRIANGLES_PER_TILE
+                )
+            if resolve:
                 depth_bits = ti.cast(key >> DEPTH_KEY_Q_BITS, ti.u32)
                 q = ti.cast(key & ti.u64(DEPTH_KEY_Q_MASK), ti.i32)
                 z = ti.bit_cast(depth_bits, ti.f32)
                 a, b, c = self.screen[q, 0], self.screen[q, 1], self.screen[q, 2]
-                area = self._edge(a.xy, b.xy, c.xy)
-                sg = 1.0 if area > 0 else -1.0
                 p = ti.Vector([ti.cast(x, ti.f32) + 0.5, ti.cast(y, ti.f32) + 0.5])
-                e = ti.Vector(
-                    [
-                        self._edge(b.xy, c.xy, p) * sg,
-                        self._edge(c.xy, a.xy, p) * sg,
-                        self._edge(a.xy, b.xy, p) * sg,
-                    ]
-                )
-                l = e / ti.abs(area)
+                e = self._edge_values(q, p)
+                l = e * self.inv_area[q]
                 w = ti.Vector(
                     [l.x * z / a.z, l.y * z / b.z, l.z * z / c.z]
                 )
@@ -1016,33 +1237,36 @@ class PlanetRenderer:
                 self.gbuffer_normal[x, y] = bn
                 self.gbuffer_material_weights[x, y] = bm
                 self.gbuffer_height_m[x, y] = bh
-                self.gbuffer_albedo[x, y] = self._debug_color(bh, slot, mode)
+                self.gbuffer_albedo[x, y] = self._surface_color(
+                    bh, bm, slot, mode
+                )
 
     @ti.kernel
-    def _shade(
+    def _shade_surface(
         self,
-        sun_local: ti.types.vector(3, ti.f32),
-        disk: ti.types.vector(3, ti.f32),
-        disk_cos: ti.f32,
-        r: ti.types.vector(3, ti.f32),
-        vu: ti.types.vector(3, ti.f32),
-        f: ti.types.vector(3, ti.f32),
-        tf: ti.f32,
-        ev: ti.f32,
+        sun_global: ti.types.vector(3, ti.f32),
+        solar_irradiance: ti.types.vector(3, ti.f32),
+        sun_transmittance: ti.template(),
+        sky_radiance: ti.template(),
+        mode: ti.i32,
     ):
-        aspect = ti.cast(self.width, ti.f32) / self.height
-        for q in ti.grouped(self.hdr):
+        for q in ti.grouped(self.surface_hdr):
             color = ti.Vector([0.00015, 0.0002, 0.00035])
             if self.gbuffer_surface_id[q] >= 0:
-                color = self.gbuffer_albedo[q]
-            else:
-                sx = ((ti.cast(q.x, ti.f32) + 0.5) / self.width * 2.0 - 1.0) * aspect
-                sy = (ti.cast(q.y, ti.f32) + 0.5) / self.height * 2.0 - 1.0
-                ray = (r * sx + vu * sy + f / tf).normalized()
-                if ray.dot(sun_local) >= disk_cos:
-                    color += disk
-            self.hdr[q] = ti.max(color, 0.0)
-            self.display[q] = display_transform(color, ev)
+                albedo = self.gbuffer_albedo[q]
+                color = albedo
+                if mode == 0:
+                    normal = self.gbuffer_normal[q].normalized()
+                    ndotl = ti.max(normal.dot(sun_global), 0.0)
+                    direct_irradiance = (
+                        solar_irradiance
+                        * sun_transmittance[q]
+                        * ndotl
+                    )
+                    color = albedo * (
+                        direct_irradiance / math.pi + sky_radiance[q]
+                    )
+            self.surface_hdr[q] = ti.max(color, 0.0)
 
     def render(
         self,
@@ -1053,21 +1277,24 @@ class PlanetRenderer:
         exposure_ev: float,
     ) -> None:
         self.planet_radius = planet.radius_m
-        anchors = np.zeros((self.max_patches, 3), np.float32)
+        anchors = self._anchors_host
         for descriptor in self._render_descriptors:
             slot = self._render_slots.get(descriptor.key)
             if slot is not None:
                 anchors[slot] = (
                     descriptor.anchor_global - camera.position_global
                 ).astype(np.float32)
-        self._set_anchors(anchors)
         frame = camera.frame(planet)
         r, vu, f = camera.view_basis_local()
         tf = math.tan(math.radians(camera.vertical_fov_degrees) / 2)
         near = 0.1
         sun_local = frame.global_to_local_direction(lighting.sun_direction_global)
-        self._clear()
-        self._transform(
+        # Keep one raster strategy for the complete frame. A probe may update
+        # ``_use_triangle_raster`` below, but that choice takes effect on the
+        # next frame so clear/bin/raster always agree on their data layout.
+        triangle_raster_this_frame = self._use_triangle_raster
+        self._prepare_frame(
+            anchors,
             tuple(frame.east),
             tuple(frame.up),
             tuple(frame.north),
@@ -1075,34 +1302,101 @@ class PlanetRenderer:
             tuple(vu),
             tuple(f),
         )
-        self._weld_edges()
-        self._stitch_lod_edges()
+        self._fix_patch_edges()
         self._clip(near, tf)
-        self._bin()
         self._raster_probe_frame += 1
-        if self._raster_probe_frame % RASTER_PROBE_INTERVAL == 0:
+        probe_this_frame = self._raster_probe_frame % RASTER_PROBE_INTERVAL == 0
+        # Pixel rasterization needs bins every frame. The direct path builds
+        # them only while probing whether tile density has fallen again.
+        if not triangle_raster_this_frame or probe_this_frame:
+            self._bin()
+        if probe_this_frame:
             # Reading one scalar every few frames avoids a per-frame
             # synchronization point while still switching to the
             # triangle-driven path as soon as tile overdraw becomes large.
             ti.sync()
+            self.last_max_tile_candidates = int(self.max_tile_candidates[None])
+            self.last_tile_overflow = int(self.tile_overflow[None])
             self._use_triangle_raster = (
-                int(self.max_tile_candidates[None]) >= TRIANGLE_RASTER_THRESHOLD
+                self.last_max_tile_candidates >= TRIANGLE_RASTER_THRESHOLD
             )
-        if self._use_triangle_raster:
-            self._raster_depth()
-            self._resolve_raster(self.debug_view)
+        if triangle_raster_this_frame:
+            self._raster_depth_direct(False)
+            self._resolve_raster(self.debug_view, False)
         else:
             self._raster_pixel(self.debug_view)
-        self._shade(
-            tuple(sun_local),
-            lighting.sun_disk_radiance,
-            math.cos(math.radians(lighting.sun_angular_radius_degrees)),
-            tuple(r),
-            tuple(vu),
-            tuple(f),
-            tf,
-            exposure_ev,
+            # The bounded fast path may overflow in dense horizon tiles.
+            # Recompute only those pixels from the complete triangle stream,
+            # then overwrite their incomplete G-buffer values before shading.
+            self._raster_depth_direct(True)
+            self._resolve_raster(self.debug_view, True)
+        camera_radius = float(np.linalg.norm(camera.position_global))
+        self.atmosphere_renderer.update(
+            planet.radius_m,
+            camera_radius,
+            sun_local,
+            lighting.solar_irradiance,
+            lighting.sun_angular_radius_degrees,
         )
+        self.atmosphere_renderer.prepare_frame(
+            self.gbuffer_position,
+            self.gbuffer_surface_id,
+            planet.radius_m,
+            camera_radius,
+            sun_local,
+            lighting.solar_irradiance,
+            lighting.sun_angular_radius_degrees,
+            (r, vu, f),
+            tf,
+        )
+        self._shade_surface(
+            tuple(lighting.sun_direction_global),
+            lighting.solar_irradiance,
+            self.atmosphere_renderer.surface_sun_transmittance,
+            self.atmosphere_renderer.surface_sky_radiance,
+            self.debug_view,
+        )
+        self.atmosphere_renderer.composite(
+            self.surface_hdr,
+            self.gbuffer_surface_id,
+            self.gbuffer_position,
+            self.hdr,
+            planet.radius_m,
+            camera_radius,
+            sun_local,
+            lighting.solar_irradiance,
+            lighting.sun_disk_radiance,
+            lighting.sun_angular_radius_degrees,
+            (r, vu, f),
+            tf,
+            self.atmosphere_diagnostic_view,
+        )
+        diagnostic = self.atmosphere_diagnostic_view
+        self.postprocessor.process(
+            self.hdr,
+            self.display,
+            exposure_ev,
+            bloom=diagnostic.uses_bloom,
+            tone_map=diagnostic.is_radiance,
+        )
+
+    def warmup_raster_paths(
+        self,
+        planet: PlanetModel,
+        camera: PlanetCamera,
+        lighting: LightingState,
+        surface_albedo: tuple[float, float, float],
+        exposure_ev: float,
+    ) -> None:
+        """Compile both raster strategies before an interactive frame can select one."""
+
+        previous = self._use_triangle_raster
+        for triangle_raster in (False, True):
+            self._use_triangle_raster = triangle_raster
+            self.render(planet, camera, lighting, surface_albedo, exposure_ev)
+        ti.sync()
+        self._use_triangle_raster = previous
+        self._raster_probe_frame = 0
 
     @property
     def vertex_count(self) -> int:
@@ -1130,7 +1424,7 @@ class PlanetRenderer:
             self.patch_count,
             self.vertex_count,
             self.triangle_count,
-            int(self.tile_overflow[None]),
+            self.last_tile_overflow,
         )
 
     def display_numpy(self) -> np.ndarray:

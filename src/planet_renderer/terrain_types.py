@@ -54,8 +54,6 @@ class TerrainPatchRenderDescriptor:
 
     key: PatchKey
     anchor_global: np.ndarray
-    sse: float
-    priority: float
     skirt_mask: int = 0
     stitch_mask: int = 0
 
