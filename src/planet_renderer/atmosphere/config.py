@@ -54,8 +54,6 @@ class AtmosphereConfig:
     multi_scattering_directions: int = 16
     multi_scattering_steps: int = 12
     sky_view_steps: int = 24
-    sky_horizon_direct_steps: int = 16
-    sky_horizon_direct_width_cosine: float = 0.04
     aerial_steps_per_slice: int = 2
     aerial_horizon_raymarch_steps: int = 12
     aerial_terminator_substeps: int = 8
@@ -124,12 +122,6 @@ class AtmosphereConfig:
             raise ValueError("multi_scattering_steps must be in 4..128")
         if not 4 <= self.sky_view_steps <= 256:
             raise ValueError("sky_view_steps must be in 4..256")
-        if not 4 <= self.sky_horizon_direct_steps <= 64:
-            raise ValueError("sky_horizon_direct_steps must be in 4..64")
-        if not 0.0 < self.sky_horizon_direct_width_cosine <= 0.25:
-            raise ValueError(
-                "sky_horizon_direct_width_cosine must be in (0, 0.25]"
-            )
         if not 1 <= self.aerial_steps_per_slice <= 16:
             raise ValueError("aerial_steps_per_slice must be in 1..16")
         if not 4 <= self.aerial_horizon_raymarch_steps <= 64:
@@ -257,18 +249,6 @@ class AtmosphereConfig:
             ),
             sky_view_steps=int(
                 values.get("sky_view_steps", defaults.sky_view_steps)
-            ),
-            sky_horizon_direct_steps=int(
-                values.get(
-                    "sky_horizon_direct_steps",
-                    defaults.sky_horizon_direct_steps,
-                )
-            ),
-            sky_horizon_direct_width_cosine=float(
-                values.get(
-                    "sky_horizon_direct_width_cosine",
-                    defaults.sky_horizon_direct_width_cosine,
-                )
             ),
             aerial_steps_per_slice=int(
                 values.get(

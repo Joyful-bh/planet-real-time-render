@@ -342,12 +342,13 @@ what permits centimetre/metre camera clearance around an Earth-radius planet;
 changing metres to kilometres alone would not recover the lost relative f32
 precision.
 
-Sky-View remains the low-frequency cache for the common background path. Its
-angular interpolation is not authoritative in the narrow horizon band, where
-optical depth and the dawn/dusk shadow source have screen-frequency gradients.
-That band smoothly blends to bounded per-pixel integration using the same
-altitude-stable interval and terminator refinement as surface aerial
-perspective. `sky_horizon_direct_width_cosine` controls only the blend width;
-`sky_horizon_direct_steps` controls its base quadrature. Increasing global LUT
-resolution or relying on temporal filtering is not a substitute for this
-high-frequency path.
+Sky-View is the single authoritative radiance source for background atmosphere
+in both its diagnostic view and final Composite. The renderer must not replace
+an angular band with a deterministic low-sample per-pixel march: doing so gives
+equal-height pixels correlated quadrature error and exposes horizontal
+dawn/dusk layers that are absent from the LUT. Surface aerial perspective keeps
+its separate G-buffer-bounded direct path because it integrates to real terrain
+depth rather than generating background sky. A future full-resolution sky
+integrator requires stochastic sampling plus temporal reconstruction and must
+be introduced as a measured replacement for Sky-View, not blended into it as a
+second simultaneous source of truth.

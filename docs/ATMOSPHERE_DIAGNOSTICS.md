@@ -94,8 +94,8 @@ quadrature aliasing and is not the production fix.
 
 Use altitudes `0.1, 0.25, 0.5, 1, 2, 5, 10` metres with fixed yaw/pitch. In
 `Atmo: Camera T`, the sky side of the analytic horizon must contain no isolated
-zeros and the boundary must move monotonically. The final composite uses a
-direct integration band around that horizon while `Atmo: Sky-view` deliberately
-continues to display the raw cache. A band visible only in raw Sky-view but not
-Composite demonstrates that the high-frequency fallback is working; a band in
-both indicates an integration/source problem rather than LUT interpolation.
+zeros and the boundary must move monotonically. Background atmosphere in final
+Composite and `Atmo: Sky-view` samples the same Sky-View radiance. If a band is
+present only in Composite, isolate the remaining Composite-only inputs in this
+order: surface aerial perspective, camera transmittance, finite sun disk and
+Bloom. Do not add a second fixed-step sky integrator to hide a smooth LUT.

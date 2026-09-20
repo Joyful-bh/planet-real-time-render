@@ -1571,139 +1571,6 @@ class AtmosphereRenderer:
         return low * (1.0 - fy) + high * fy
 
     @ti.func
-    def _integrate_camera_sky(
-        self,
-        camera_altitude,
-        ray: ti.template(),
-        sun: ti.template(),
-        solar_irradiance: ti.template(),
-        bottom_radius,
-        sun_angular_radius,
-    ):
-        """Integrate a high-frequency camera ray without angular LUT reuse."""
-
-        origin = ti.Vector(
-            [0.0, bottom_radius + camera_altitude, 0.0]
-        )
-        start, end, valid, _ = self._atmosphere_segment_from_altitude(
-            camera_altitude,
-            ray.y,
-            bottom_radius,
-        )
-        radiance = ti.Vector.zero(ti.f32, 3)
-        view_transmission = ti.Vector([1.0, 1.0, 1.0])
-        if valid:
-            root0, root1, valid0, valid1 = self._solar_shadow_roots(
-                origin,
-                ray,
-                sun,
-                bottom_radius,
-            )
-            index = 0
-            while index < ti.static(self.config.sky_horizon_direct_steps):
-                fraction0 = ti.cast(index, ti.f32) / ti.static(
-                    self.config.sky_horizon_direct_steps
-                )
-                fraction1 = ti.cast(index + 1, ti.f32) / ti.static(
-                    self.config.sky_horizon_direct_steps
-                )
-                distance0 = self._warped_interval_boundary(
-                    origin,
-                    ray,
-                    start,
-                    end,
-                    fraction0,
-                )
-                distance1 = self._warped_interval_boundary(
-                    origin,
-                    ray,
-                    start,
-                    end,
-                    fraction1,
-                )
-                refinement = self._terminator_refinement_weight(
-                    origin,
-                    camera_altitude,
-                    ray,
-                    distance0,
-                    distance1,
-                    sun,
-                    bottom_radius,
-                    sun_angular_radius,
-                    root0,
-                    root1,
-                    valid0,
-                    valid1,
-                )
-                interval_radiance, interval_transmission = (
-                    self._integrate_adaptive_scattering_interval(
-                        origin,
-                        camera_altitude,
-                        ray,
-                        distance0,
-                        distance1,
-                        sun,
-                        solar_irradiance,
-                        bottom_radius,
-                        sun_angular_radius,
-                        refinement,
-                    )
-                )
-                radiance += view_transmission * interval_radiance
-                view_transmission *= interval_transmission
-                index += 1
-        return ti.max(radiance, 0.0)
-
-    @ti.func
-    def _camera_sky_radiance(
-        self,
-        camera_altitude,
-        sky_lut_camera_altitude,
-        ray: ti.template(),
-        sun: ti.template(),
-        solar_irradiance: ti.template(),
-        bottom_radius,
-        sun_angular_radius,
-    ):
-        """Use the LUT for smooth sky and direct integration at the horizon."""
-
-        lut_radiance = self._sample_sky_view(
-            ray,
-            sun,
-            sky_lut_camera_altitude,
-            bottom_radius,
-        )
-        radius = bottom_radius + ti.max(camera_altitude, 0.0)
-        horizon_cosine = -self._shell_rho(
-            camera_altitude,
-            bottom_radius,
-        ) / ti.max(radius, 1.0)
-        width = ti.static(self.config.sky_horizon_direct_width_cosine)
-        direct_weight = ti.math.clamp(
-            1.0 - ti.abs(ray.y - horizon_cosine) / width,
-            0.0,
-            1.0,
-        )
-        direct_weight = direct_weight * direct_weight * (
-            3.0 - 2.0 * direct_weight
-        )
-        result = lut_radiance
-        if direct_weight > 0.0:
-            direct_radiance = self._integrate_camera_sky(
-                camera_altitude,
-                ray,
-                sun,
-                solar_irradiance,
-                bottom_radius,
-                sun_angular_radius,
-            )
-            result = (
-                lut_radiance * (1.0 - direct_weight)
-                + direct_radiance * direct_weight
-            )
-        return result
-
-    @ti.func
     def _sample_aerial_field(
         self,
         field: ti.template(),
@@ -2095,14 +1962,11 @@ class AtmosphereRenderer:
                         bottom_radius,
                     )
                     color = (
-                        self._camera_sky_radiance(
-                            camera_altitude,
-                            sky_lut_camera_altitude,
+                        self._sample_sky_view(
                             ray,
                             sun_local,
-                            solar_irradiance,
+                            sky_lut_camera_altitude,
                             bottom_radius,
-                            sun_angular_radius,
                         )
                         + color * transmission
                     )

@@ -997,12 +997,13 @@ Transmittance-LUT coordinates likewise use altitude and factored shell height.
 Surface lighting and camera-to-surface reconstruction derive endpoint altitude
 from a stable radial-delta expression.
 
-The low-resolution Sky-View cache remains appropriate for smooth regions, but
-is not sampled as the final authority around the projected horizon. A narrow
-smooth band now uses per-pixel altitude-warped integration with local
-terminator refinement. New controls are `sky_horizon_direct_steps` and
-`sky_horizon_direct_width_cosine`; the Earth preset spends the higher count
-only in that band.
+Sky-View remains the authoritative background-sky radiance. An initial
+follow-up attempted to replace a narrow horizon band with deterministic
+per-pixel integration. Visual acceptance showed that raw Sky-View stayed
+smooth while Composite acquired correlated dawn/dusk color layers: equal-height
+pixels shared the same finite quadrature transitions. That fallback and its
+`sky_horizon_direct_*` controls were removed rather than retained as a second
+sky implementation. The stable altitude and interval work remains active.
 
 ### Verification
 
@@ -1011,6 +1012,10 @@ Earth-radius CPU render regression JIT-compiles both raster paths and every
 atmosphere diagnostic, checks finite/bounded outputs, exercises live/frozen LUT
 updates and passes. Interactive CUDA checks at 0.1-10 m altitude and the
 reported dawn/dusk views remain user-run.
+
+Follow-up validation identified and removed the Composite-only sky integrator.
+The focused regression was rerun after the removal; final interactive visual
+acceptance remains user-run.
 
 ### Remaining limitation
 
