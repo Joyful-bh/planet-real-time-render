@@ -28,6 +28,15 @@ _DIAGNOSTIC_AERIAL_SCATTERING = int(
 _DIAGNOSTIC_AERIAL_TRANSMITTANCE = int(
     AtmosphereDiagnosticView.AERIAL_TRANSMITTANCE
 )
+_DIAGNOSTIC_AERIAL_FROXEL_ONLY = int(
+    AtmosphereDiagnosticView.AERIAL_FROXEL_ONLY
+)
+_DIAGNOSTIC_AERIAL_DIRECT_ONLY = int(
+    AtmosphereDiagnosticView.AERIAL_DIRECT_ONLY
+)
+_DIAGNOSTIC_AERIAL_BLEND_WEIGHT = int(
+    AtmosphereDiagnosticView.AERIAL_BLEND_WEIGHT
+)
 
 
 @ti.data_oriented
@@ -957,61 +966,6 @@ class AtmosphereRenderer:
         return ti.max(proximity, penumbra)
 
     @ti.func
-    def _surface_terminator_weight(
-        self,
-        origin: ti.template(),
-        ray: ti.template(),
-        surface_distance,
-        sun: ti.template(),
-        bottom_radius,
-        sun_angular_radius,
-    ):
-        """Select direct integration for surface paths crossing a terminator."""
-
-        weight = 0.0
-        top_radius = bottom_radius + ti.static(self.config.top_altitude_m)
-        outer_near, outer_far, outer_hit = self._sphere_roots(
-            origin,
-            ray,
-            top_radius,
-        )
-        start = ti.max(outer_near, 0.0)
-        end = ti.min(surface_distance, outer_far)
-        if outer_hit and end > start:
-            root0, root1, valid0, valid1 = self._solar_shadow_roots(
-                origin,
-                ray,
-                sun,
-                bottom_radius,
-            )
-            # The finite disk turns the ideal cylinder into a penumbra whose
-            # characteristic width grows with planet radius and angular size.
-            fade_distance = ti.max(
-                bottom_radius * sun_angular_radius * 2.0,
-                1.0,
-            )
-            closest = 1.0e30
-            if valid0 != 0:
-                root_distance = ti.max(
-                    ti.max(start - root0, root0 - end),
-                    0.0,
-                )
-                closest = ti.min(closest, root_distance)
-            if valid1 != 0:
-                root_distance = ti.max(
-                    ti.max(start - root1, root1 - end),
-                    0.0,
-                )
-                closest = ti.min(closest, root_distance)
-            weight = ti.math.clamp(
-                1.0 - closest / fade_distance,
-                0.0,
-                1.0,
-            )
-            weight = weight * weight * (3.0 - 2.0 * weight)
-        return weight
-
-    @ti.func
     def _integrate_adaptive_scattering_interval(
         self,
         origin: ti.template(),
@@ -1803,8 +1757,6 @@ class AtmosphereRenderer:
     @ti.func
     def _surface_aerial_scattering(
         self,
-        screen_u,
-        screen_v,
         surface_distance,
         camera_altitude,
         ray: ti.template(),
@@ -1813,54 +1765,25 @@ class AtmosphereRenderer:
         bottom_radius,
         sun_angular_radius,
     ):
-        """Use froxels in smooth regions and true integration at the limb."""
+        """Integrate the camera-to-surface path without screen-space froxels.
 
-        froxel = self._sample_aerial_scattering(
-            screen_u,
-            screen_v,
-            surface_distance,
-            camera_altitude,
-            ray,
-            bottom_radius,
-        )
+        The low-resolution froxel volume remains useful for diagnostics, but
+        cannot reconstruct the high angular gradients at an Earth-scale limb
+        and terminator without view-locked bands.  Surface pixels therefore
+        use the continuous per-pixel path that the direct diagnostic verified.
+        """
+
         origin = ti.Vector([0.0, bottom_radius + camera_altitude, 0.0])
-        surface_point = origin + ray * surface_distance
-        surface_radius = surface_point.norm()
-        surface_radial = surface_point / ti.max(surface_radius, 1.0)
-        limb_cosine = ti.max(surface_radial.dot(-ray), 0.0)
-        inner = ti.static(self.config.aerial_horizon_inner_cosine)
-        outer = ti.static(self.config.aerial_horizon_outer_cosine)
-        direct_weight = ti.math.clamp(
-            (outer - limb_cosine) / ti.max(outer - inner, 1.0e-6),
-            0.0,
-            1.0,
-        )
-        direct_weight = direct_weight * direct_weight * (
-            3.0 - 2.0 * direct_weight
-        )
-        terminator_weight = self._surface_terminator_weight(
+        return self._integrate_surface_scattering(
             origin,
+            camera_altitude,
             ray,
             surface_distance,
             sun,
+            solar_irradiance,
             bottom_radius,
             sun_angular_radius,
         )
-        direct_weight = ti.max(direct_weight, terminator_weight)
-        result = froxel
-        if direct_weight > 0.0:
-            direct = self._integrate_surface_scattering(
-                origin,
-                camera_altitude,
-                ray,
-                surface_distance,
-                sun,
-                solar_irradiance,
-                bottom_radius,
-                sun_angular_radius,
-            )
-            result = froxel * (1.0 - direct_weight) + direct * direct_weight
-        return result
 
     @ti.func
     def _camera_transmittance(
@@ -1935,8 +1858,6 @@ class AtmosphereRenderer:
                 if surface_id[pixel] >= 0:
                     surface_distance = position_view[pixel].norm()
                     scattering = self._surface_aerial_scattering(
-                        screen_u,
-                        screen_v,
                         surface_distance,
                         camera_altitude,
                         ray,
@@ -2045,8 +1966,6 @@ class AtmosphereRenderer:
                 color = ti.Vector.zero(ti.f32, 3)
                 if surface_id[pixel] >= 0:
                     color = self._surface_aerial_scattering(
-                        screen_u,
-                        screen_v,
                         position_view[pixel].norm(),
                         camera_altitude,
                         ray,
@@ -2055,6 +1974,40 @@ class AtmosphereRenderer:
                         bottom_radius,
                         sun_angular_radius,
                     )
+            elif diagnostic_view == _DIAGNOSTIC_AERIAL_FROXEL_ONLY:
+                color = ti.Vector.zero(ti.f32, 3)
+                if surface_id[pixel] >= 0:
+                    color = self._sample_aerial_scattering(
+                        screen_u,
+                        screen_v,
+                        position_view[pixel].norm(),
+                        camera_altitude,
+                        ray,
+                        bottom_radius,
+                    )
+            elif diagnostic_view == _DIAGNOSTIC_AERIAL_DIRECT_ONLY:
+                color = ti.Vector.zero(ti.f32, 3)
+                if surface_id[pixel] >= 0:
+                    origin = ti.Vector(
+                        [0.0, bottom_radius + camera_altitude, 0.0]
+                    )
+                    color = self._integrate_surface_scattering(
+                        origin,
+                        camera_altitude,
+                        ray,
+                        position_view[pixel].norm(),
+                        sun_local,
+                        solar_irradiance,
+                        bottom_radius,
+                        sun_angular_radius,
+                    )
+            elif diagnostic_view == _DIAGNOSTIC_AERIAL_BLEND_WEIGHT:
+                weight = 0.0
+                if surface_id[pixel] >= 0:
+                    # Composite now uses the verified direct estimator for
+                    # every surface pixel, so its direct contribution is one.
+                    weight = 1.0
+                color = ti.Vector([weight, weight, weight])
             elif diagnostic_view == _DIAGNOSTIC_AERIAL_TRANSMITTANCE:
                 color = ti.Vector.zero(ti.f32, 3)
                 if surface_id[pixel] >= 0:

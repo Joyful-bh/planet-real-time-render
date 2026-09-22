@@ -50,9 +50,29 @@
     "sky_view_steps": 24,
     "aerial_steps_per_slice": 2,
     "aerial_horizon_raymarch_steps": 12,
-    "aerial_terminator_substeps": 8,
-    "aerial_horizon_inner_cosine": 0.06,
-    "aerial_horizon_outer_cosine": 0.18
+    "aerial_terminator_substeps": 8
+  },
+  "ocean": {
+    "surface_enabled": true,
+    "enabled": true,
+    "albedo": [0.012, 0.055, 0.16],
+    "roughness": 0.12,
+    "normal_strength": 0.32,
+    "sky_reflection_strength": 1.0,
+    "dielectric_f0": 0.02,
+    "absorption_per_m": [0.14, 0.055, 0.022],
+    "scattering_per_m": [0.0025, 0.005, 0.012],
+    "max_visible_depth_m": 80.0,
+    "spectrum_resolution": 128,
+    "wind_speed_mps": 8.0,
+    "wind_direction_degrees": 35.0,
+    "wave_height_scale": 1.0,
+    "choppiness": 0.65,
+    "geometry_cascades": 2,
+    "geometry_max_distance_m": 25000.0,
+    "refraction_index": 1.333,
+    "refraction_strength": 1.0,
+    "refraction_max_offset_pixels": 48.0
   },
   "terrain": {
     "generator": "procedural_landforms_v1",

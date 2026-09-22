@@ -57,8 +57,6 @@ class AtmosphereConfig:
     aerial_steps_per_slice: int = 2
     aerial_horizon_raymarch_steps: int = 12
     aerial_terminator_substeps: int = 8
-    aerial_horizon_inner_cosine: float = 0.06
-    aerial_horizon_outer_cosine: float = 0.18
 
     def __post_init__(self) -> None:
         coefficient_groups = {
@@ -128,16 +126,6 @@ class AtmosphereConfig:
             raise ValueError("aerial_horizon_raymarch_steps must be in 4..64")
         if not 2 <= self.aerial_terminator_substeps <= 16:
             raise ValueError("aerial_terminator_substeps must be in 2..16")
-        horizon_cosines = (
-            self.aerial_horizon_inner_cosine,
-            self.aerial_horizon_outer_cosine,
-        )
-        if not all(math.isfinite(value) for value in horizon_cosines):
-            raise ValueError("aerial horizon cosines must be finite")
-        if not 0.0 <= horizon_cosines[0] < horizon_cosines[1] <= 1.0:
-            raise ValueError(
-                "aerial horizon cosines must satisfy 0 <= inner < outer <= 1"
-            )
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, object]) -> "AtmosphereConfig":
@@ -266,18 +254,6 @@ class AtmosphereConfig:
                 values.get(
                     "aerial_terminator_substeps",
                     defaults.aerial_terminator_substeps,
-                )
-            ),
-            aerial_horizon_inner_cosine=float(
-                values.get(
-                    "aerial_horizon_inner_cosine",
-                    defaults.aerial_horizon_inner_cosine,
-                )
-            ),
-            aerial_horizon_outer_cosine=float(
-                values.get(
-                    "aerial_horizon_outer_cosine",
-                    defaults.aerial_horizon_outer_cosine,
                 )
             ),
         )

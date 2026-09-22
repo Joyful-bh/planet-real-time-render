@@ -16,6 +16,7 @@ from .atmosphere import AtmosphereDiagnosticView
 from .camera import PlanetCamera
 from .config import M0Config, load_config
 from .lighting import LightingState, StaticLightingProvider
+from .ocean import opaque_surface_height_m
 from .planet import FloatingOrigin, PlanetModel
 from .renderer import PlanetRenderer
 from .terrain import CubeSphereTerrain, TerrainSettings
@@ -32,6 +33,9 @@ _ATMOSPHERE_DIAGNOSTIC_BUTTONS = (
         AtmosphereDiagnosticView.MULTI_SCATTERING_LUT,
     ),
     ("Atmo: Aerial scattering", AtmosphereDiagnosticView.AERIAL_SCATTERING),
+    ("Aerial: Froxel only", AtmosphereDiagnosticView.AERIAL_FROXEL_ONLY),
+    ("Aerial: Direct only", AtmosphereDiagnosticView.AERIAL_DIRECT_ONLY),
+    ("Aerial: Blend weight", AtmosphereDiagnosticView.AERIAL_BLEND_WEIGHT),
     (
         "Atmo: Aerial transmittance",
         AtmosphereDiagnosticView.AERIAL_TRANSMITTANCE,
@@ -93,6 +97,42 @@ def initial_state(config: M0Config):
     return planet, camera, StaticLightingProvider(lighting), origin
 
 
+def _active_surface_height_m(
+    terrain: CubeSphereTerrain,
+    direction: np.ndarray,
+    ocean_enabled: bool,
+) -> float:
+    """Return the opaque surface height used for camera clearance.
+
+    Terrain below the reference radius is seabed when the sea-level coverage
+    pass is enabled.  The camera must therefore be constrained against height
+    zero rather than against the visually hidden seabed.
+    """
+
+    terrain_height = terrain.describe_surface(direction).height_m
+    return opaque_surface_height_m(terrain_height, ocean_enabled)
+
+
+def _constrain_camera_to_surface(
+    planet: PlanetModel,
+    camera: PlanetCamera,
+    terrain: CubeSphereTerrain,
+    ocean_enabled: bool,
+    minimum_clearance_m: float = 0.5,
+) -> float:
+    radius = float(np.linalg.norm(camera.position_global))
+    direction = camera.position_global / max(radius, 1.0)
+    surface_height = _active_surface_height_m(
+        terrain,
+        direction,
+        ocean_enabled,
+    )
+    minimum_radius = planet.radius_m + surface_height + minimum_clearance_m
+    if radius < minimum_radius:
+        camera.position_global = direction * minimum_radius
+    return surface_height
+
+
 def save_image(
     renderer: PlanetRenderer, path: Path | None, hdr_path: Path | None
 ) -> None:
@@ -123,6 +163,7 @@ def run_preview(
     mouse_sensitivity, speed_exponent = 180.0, 2.0
     exposure = config.postprocess.exposure_ev
     last_time = time.perf_counter()
+    preview_start_time = last_time
     preview_frame = 0
     camera_input_frozen = False
     terrain_lod_frozen = False
@@ -132,6 +173,12 @@ def run_preview(
         thread_name_prefix="terrain-stream",
     )
     terrain_stats = terrain.tile_manager.stats
+    active_surface_height = _constrain_camera_to_surface(
+        planet,
+        camera,
+        terrain,
+        config.ocean.surface_enabled,
+    )
     while window.running:
         now = time.perf_counter()
         dt, last_time = min(now - last_time, 0.1), now
@@ -177,6 +224,12 @@ def run_preview(
             if length > 0.0:
                 distance = 10.0**speed_exponent * dt
                 camera.move_local(planet, *(motion / length * distance))
+                active_surface_height = _constrain_camera_to_surface(
+                    planet,
+                    camera,
+                    terrain,
+                    config.ocean.surface_enabled,
+                )
         origin.update(camera.position_global)
 
         if terrain_future is not None and terrain_future.done():
@@ -202,12 +255,20 @@ def run_preview(
                 config.height,
             )
         renderer.render(
-            planet, camera, provider.snapshot(), config.surface_albedo, exposure
+            planet,
+            camera,
+            provider.snapshot(),
+            config.surface_albedo,
+            exposure,
+            now - preview_start_time,
         )
         canvas.set_image(renderer.display)
         altitude = planet.altitude_m(camera.position_global)
         with gui.sub_window("M0 Planet", 0.705, 0.02, 0.28, 0.96) as panel:
             panel.text(f"Altitude: {altitude:,.2f} m")
+            panel.text(
+                f"Surface clearance: {altitude - active_surface_height:,.2f} m"
+            )
             panel.text(
                 f"Horizon: {planet.horizon_distance_m(altitude) / 1000.0:,.2f} km"
             )
@@ -364,9 +425,13 @@ def run_preview(
                 direction = camera.position_global / np.linalg.norm(
                     camera.position_global
                 )
-                terrain_height = terrain.describe_surface(direction).height_m
+                active_surface_height = _active_surface_height_m(
+                    terrain,
+                    direction,
+                    config.ocean.surface_enabled,
+                )
                 camera.position_global = planet.surface_position(
-                    direction, terrain_height + 2.0
+                    direction, active_surface_height + 2.0
                 )
             if panel.button("High atmosphere (50 km)"):
                 camera.position_global = planet.surface_position(
@@ -417,9 +482,13 @@ def main(argv: list[str] | None = None) -> int:
         requested_altitude = planet.altitude_m(camera.position_global)
         if requested_altitude < 20_000.0:
             direction = camera.position_global / np.linalg.norm(camera.position_global)
-            terrain_height = terrain.describe_surface(direction).height_m
+            surface_height = _active_surface_height_m(
+                terrain,
+                direction,
+                config.ocean.surface_enabled,
+            )
             camera.position_global = planet.surface_position(
-                direction, terrain_height + max(requested_altitude, 2.0)
+                direction, surface_height + max(requested_altitude, 2.0)
             )
             origin.origin_global = camera.position_global.copy()
         renderer = PlanetRenderer(
@@ -430,6 +499,7 @@ def main(argv: list[str] | None = None) -> int:
             config.postprocess,
             config.terrain_max_gpu_patches,
             config.terrain_patch_resolution,
+            config.ocean,
         )
         # 两个固定预算 bootstrap tick 使六个根 patch 可作为初始 fallback；不等待细分完成。
         renderer.apply_terrain_frame(

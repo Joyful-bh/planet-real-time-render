@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .atmosphere import AtmosphereConfig
+from .ocean import OceanConfig
 from .postprocess import PostprocessConfig
 from .terrain_config import TerrainConfig
 
@@ -28,6 +29,7 @@ class M0Config:
     surface_albedo: tuple[float, float, float] = (0.16, 0.20, 0.12)
     floating_origin_threshold_m: float = 10_000.0
     atmosphere: AtmosphereConfig = field(default_factory=AtmosphereConfig)
+    ocean: OceanConfig = field(default_factory=OceanConfig)
     postprocess: PostprocessConfig = field(default_factory=PostprocessConfig)
     terrain: TerrainConfig = field(default_factory=TerrainConfig)
     terrain_patch_resolution: int = 12
@@ -58,7 +60,7 @@ def load_config(path: Path) -> M0Config:
             "v3 removes lighting.sun_disk_radiance and moves exposure_ev "
             "from rendering to postprocess"
         )
-    r, p, c, l, a, pp, t = (
+    r, p, c, l, a, o, pp, t = (
         data.get(k, {})
         for k in (
             "rendering",
@@ -66,6 +68,7 @@ def load_config(path: Path) -> M0Config:
             "camera",
             "lighting",
             "atmosphere",
+            "ocean",
             "postprocess",
             "terrain",
         )
@@ -92,6 +95,7 @@ def load_config(path: Path) -> M0Config:
             c.get("floating_origin_threshold_m", 10_000.0)
         ),
         atmosphere=AtmosphereConfig.from_mapping(a),
+        ocean=OceanConfig.from_mapping(o),
         postprocess=PostprocessConfig.from_mapping(pp),
         terrain=TerrainConfig(
             generator=t.get("generator", "procedural_fbm_v1"),

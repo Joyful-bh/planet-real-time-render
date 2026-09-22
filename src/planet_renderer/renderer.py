@@ -20,6 +20,7 @@ from .atmosphere import (
 from .camera import PlanetCamera
 from .height import TerrainHeightModel
 from .lighting import LightingState
+from .ocean import OCEAN_SURFACE_ID, OceanConfig, OceanRenderer
 from .planet import PlanetModel
 from .postprocess import PostprocessConfig, PostProcessor
 from .terrain_lod import cube_face_direction
@@ -111,6 +112,7 @@ class PlanetRenderer:
         postprocess_config: PostprocessConfig,
         max_patches: int = 256,
         patch_resolution: int = 12,
+        ocean_config: OceanConfig | None = None,
     ):
         self.width, self.height = width, height
         self.max_patches = max_patches
@@ -138,6 +140,11 @@ class PlanetRenderer:
             width,
             height,
             atmosphere_config,
+        )
+        self.ocean_renderer = OceanRenderer(
+            width,
+            height,
+            ocean_config or OceanConfig(),
         )
         self.postprocessor = PostProcessor(width, height, postprocess_config)
         self.local_triangles = ti.Vector.field(
@@ -223,8 +230,19 @@ class PlanetRenderer:
         self.gbuffer_albedo = ti.Vector.field(3, ti.f32, shape=shape)
         self.gbuffer_material_weights = ti.Vector.field(4, ti.f32, shape=shape)
         self.gbuffer_height_m = ti.field(ti.f32, shape=shape)
+        self.gbuffer_water_depth_m = ti.field(ti.f32, shape=shape)
+        self.gbuffer_seabed_albedo = ti.Vector.field(3, ti.f32, shape=shape)
+        self.gbuffer_seabed_normal = ti.Vector.field(3, ti.f32, shape=shape)
+        self.gbuffer_ocean_slope_variance = ti.field(ti.f32, shape=shape)
         self.gbuffer_surface_id = ti.field(ti.i32, shape=shape)
         self.gbuffer_surface_cell_id = ti.field(ti.i32, shape=shape)
+        # The ocean pass replaces the visible G-buffer sample.  Refraction
+        # still needs the opaque terrain that existed before that replacement,
+        # so retain a compact pre-water snapshot for screen-space lookup.
+        self.terrain_position = ti.Vector.field(3, ti.f32, shape=shape)
+        self.terrain_normal = ti.Vector.field(3, ti.f32, shape=shape)
+        self.terrain_albedo = ti.Vector.field(3, ti.f32, shape=shape)
+        self.terrain_surface_id = ti.field(ti.i32, shape=shape)
         self.surface_hdr = ti.Vector.field(3, ti.f32, shape=shape)
         self.hdr = ti.Vector.field(3, ti.f32, shape=shape)
         self.display = ti.Vector.field(3, ti.f32, shape=shape)
@@ -1242,12 +1260,35 @@ class PlanetRenderer:
                 )
 
     @ti.kernel
+    def _snapshot_terrain_gbuffer(self):
+        for q in ti.grouped(self.gbuffer_surface_id):
+            self.terrain_position[q] = self.gbuffer_position[q]
+            self.terrain_normal[q] = self.gbuffer_normal[q]
+            self.terrain_albedo[q] = self.gbuffer_albedo[q]
+            self.terrain_surface_id[q] = self.gbuffer_surface_id[q]
+
+    @ti.kernel
     def _shade_surface(
         self,
         sun_global: ti.types.vector(3, ti.f32),
         solar_irradiance: ti.types.vector(3, ti.f32),
         sun_transmittance: ti.template(),
         sky_radiance: ti.template(),
+        view_right_global: ti.types.vector(3, ti.f32),
+        view_up_global: ti.types.vector(3, ti.f32),
+        view_forward_global: ti.types.vector(3, ti.f32),
+        advanced_ocean_enabled: ti.i32,
+        ocean_roughness: ti.f32,
+        ocean_f0: ti.f32,
+        ocean_sky_strength: ti.f32,
+        ocean_absorption: ti.types.vector(3, ti.f32),
+        ocean_scattering: ti.types.vector(3, ti.f32),
+        ocean_max_depth: ti.f32,
+        ocean_refraction_index: ti.f32,
+        ocean_refraction_strength: ti.f32,
+        ocean_refraction_max_offset_pixels: ti.f32,
+        sun_angular_radius: ti.f32,
+        tangent_half_fov: ti.f32,
         mode: ti.i32,
     ):
         for q in ti.grouped(self.surface_hdr):
@@ -1266,6 +1307,264 @@ class PlanetRenderer:
                     color = albedo * (
                         direct_irradiance / math.pi + sky_radiance[q]
                     )
+                    if (
+                        self.gbuffer_surface_id[q] == OCEAN_SURFACE_ID
+                        and advanced_ocean_enabled != 0
+                    ):
+                        position = self.gbuffer_position[q]
+                        view_direction = -(
+                            view_right_global * position.x
+                            + view_up_global * position.y
+                            + view_forward_global * position.z
+                        ).normalized()
+                        ndotv = ti.max(normal.dot(view_direction), 1.0e-4)
+                        half_sum = view_direction + sun_global
+                        half_vector = half_sum / ti.max(half_sum.norm(), 1.0e-5)
+                        ndoth = ti.max(normal.dot(half_vector), 0.0)
+                        vdoth = ti.max(view_direction.dot(half_vector), 0.0)
+
+                        one_minus_v = 1.0 - ndotv
+                        fresnel_view = ocean_f0 + (1.0 - ocean_f0) * (
+                            one_minus_v * one_minus_v * one_minus_v
+                            * one_minus_v * one_minus_v
+                        )
+                        one_minus_h = 1.0 - vdoth
+                        fresnel_sun = ocean_f0 + (1.0 - ocean_f0) * (
+                            one_minus_h * one_minus_h * one_minus_h
+                            * one_minus_h * one_minus_h
+                        )
+
+                        base_alpha = ocean_roughness * ocean_roughness
+                        solar_slope_variance = ti.tan(sun_angular_radius) ** 2
+                        alpha2 = (
+                            base_alpha * base_alpha
+                            + self.gbuffer_ocean_slope_variance[q]
+                            + solar_slope_variance
+                        )
+                        alpha2 = ti.math.clamp(alpha2, 1.0e-5, 1.0)
+                        denominator = ndoth * ndoth * (alpha2 - 1.0) + 1.0
+                        distribution = alpha2 / ti.max(
+                            math.pi * denominator * denominator,
+                            1.0e-5,
+                        )
+                        effective_roughness = ti.sqrt(ti.sqrt(alpha2))
+                        geometry_k = (effective_roughness + 1.0) ** 2 / 8.0
+                        geometry_v = ndotv / ti.max(
+                            ndotv * (1.0 - geometry_k) + geometry_k,
+                            1.0e-5,
+                        )
+                        geometry_l = ndotl / ti.max(
+                            ndotl * (1.0 - geometry_k) + geometry_k,
+                            1.0e-5,
+                        )
+                        sun_specular = (
+                            solar_irradiance
+                            * sun_transmittance[q]
+                            * distribution
+                            * geometry_v
+                            * geometry_l
+                            * fresnel_sun
+                            * ndotl
+                            / ti.max(4.0 * ndotv * ndotl, 1.0e-4)
+                        )
+                        reflected_sky = (
+                            sky_radiance[q]
+                            * fresnel_view
+                            * ocean_sky_strength
+                        )
+                        water_depth = ti.min(
+                            self.gbuffer_water_depth_m[q],
+                            ocean_max_depth,
+                        )
+                        seabed_albedo = self.gbuffer_seabed_albedo[q]
+                        seabed_normal = self.gbuffer_seabed_normal[q].normalized()
+
+                        # Refract the camera ray from air into water, project a
+                        # bounded endpoint back to the opaque terrain snapshot,
+                        # and bilinearly reconstruct the seabed.  Missing or
+                        # disoccluded samples fall back to the same-pixel
+                        # seabed captured by OceanRenderer.
+                        incident_view = position.normalized()
+                        normal_view = ti.Vector(
+                            [
+                                normal.dot(view_right_global),
+                                normal.dot(view_up_global),
+                                normal.dot(view_forward_global),
+                            ]
+                        ).normalized()
+                        cos_incident = ti.max(
+                            -incident_view.dot(normal_view),
+                            0.0,
+                        )
+                        eta = 1.0 / ocean_refraction_index
+                        refract_discriminant = 1.0 - eta * eta * (
+                            1.0 - cos_incident * cos_incident
+                        )
+                        refracted_view = incident_view
+                        if refract_discriminant > 0.0:
+                            refracted_view = (
+                                eta * incident_view
+                                + (
+                                    eta * cos_incident
+                                    - ti.sqrt(refract_discriminant)
+                                )
+                                * normal_view
+                            ).normalized()
+                        refracted_view = (
+                            incident_view * (1.0 - ocean_refraction_strength)
+                            + refracted_view * ocean_refraction_strength
+                        ).normalized()
+                        vertical_depth = water_depth * ti.max(
+                            -incident_view.dot(normal_view),
+                            0.05,
+                        )
+                        refracted_distance = ti.min(
+                            vertical_depth
+                            / ti.max(-refracted_view.dot(normal_view), 0.05),
+                            ocean_max_depth * 2.0,
+                        )
+                        endpoint = position + refracted_view * refracted_distance
+                        if endpoint.z > 0.1 and ocean_refraction_strength > 0.0:
+                            aspect = ti.cast(self.width, ti.f32) / self.height
+                            sample_position = ti.Vector(
+                                [
+                                    (
+                                        endpoint.x
+                                        / (endpoint.z * tangent_half_fov * aspect)
+                                        * 0.5
+                                        + 0.5
+                                    )
+                                    * self.width
+                                    - 0.5,
+                                    (
+                                        endpoint.y
+                                        / (endpoint.z * tangent_half_fov)
+                                        * 0.5
+                                        + 0.5
+                                    )
+                                    * self.height
+                                    - 0.5,
+                                ]
+                            )
+                            pixel_delta = sample_position - ti.cast(q, ti.f32)
+                            delta_length = pixel_delta.norm()
+                            if delta_length > ocean_refraction_max_offset_pixels:
+                                pixel_delta *= ocean_refraction_max_offset_pixels / ti.max(
+                                    delta_length,
+                                    1.0e-5,
+                                )
+                                sample_position = ti.cast(q, ti.f32) + pixel_delta
+                            sample_base = ti.cast(ti.floor(sample_position), ti.i32)
+                            sample_fraction = sample_position - ti.cast(
+                                sample_base,
+                                ti.f32,
+                            )
+                            accumulated_albedo = ti.Vector.zero(ti.f32, 3)
+                            accumulated_normal = ti.Vector.zero(ti.f32, 3)
+                            accumulated_position = ti.Vector.zero(ti.f32, 3)
+                            accumulated_weight = 0.0
+                            for oy in ti.static(range(2)):
+                                for ox in ti.static(range(2)):
+                                    sample = sample_base + ti.Vector([ox, oy])
+                                    inside = (
+                                        sample.x >= 0
+                                        and sample.x < self.width
+                                        and sample.y >= 0
+                                        and sample.y < self.height
+                                    )
+                                    safe_sample = ti.Vector(
+                                        [
+                                            ti.math.clamp(sample.x, 0, self.width - 1),
+                                            ti.math.clamp(sample.y, 0, self.height - 1),
+                                        ]
+                                    )
+                                    if inside and self.terrain_surface_id[safe_sample] >= 0:
+                                        candidate_position = self.terrain_position[
+                                            safe_sample
+                                        ]
+                                        candidate_distance = (
+                                            candidate_position - position
+                                        ).norm()
+                                        valid_depth = (
+                                            candidate_position.z > position.z + 0.01
+                                            and candidate_distance
+                                            <= ocean_max_depth * 2.0
+                                        )
+                                        if valid_depth:
+                                            wx = ti.select(
+                                                ox == 0,
+                                                1.0 - sample_fraction.x,
+                                                sample_fraction.x,
+                                            )
+                                            wy = ti.select(
+                                                oy == 0,
+                                                1.0 - sample_fraction.y,
+                                                sample_fraction.y,
+                                            )
+                                            weight = wx * wy
+                                            accumulated_albedo += (
+                                                self.terrain_albedo[safe_sample]
+                                                * weight
+                                            )
+                                            accumulated_normal += (
+                                                self.terrain_normal[safe_sample]
+                                                * weight
+                                            )
+                                            accumulated_position += (
+                                                candidate_position * weight
+                                            )
+                                            accumulated_weight += weight
+                            if accumulated_weight > 0.25:
+                                inverse_weight = 1.0 / accumulated_weight
+                                seabed_albedo = accumulated_albedo * inverse_weight
+                                seabed_normal = (
+                                    accumulated_normal * inverse_weight
+                                ).normalized()
+                                refracted_seabed_position = (
+                                    accumulated_position * inverse_weight
+                                )
+                                water_depth = ti.min(
+                                    (refracted_seabed_position - position).norm(),
+                                    ocean_max_depth,
+                                )
+                        water_extinction = ocean_absorption + ocean_scattering
+                        water_transmission = ti.exp(
+                            -water_extinction * water_depth
+                        )
+                        seabed_ndotl = ti.max(
+                            seabed_normal.dot(sun_global),
+                            0.0,
+                        )
+                        seabed_direct = (
+                            solar_irradiance
+                            * sun_transmittance[q]
+                            * seabed_ndotl
+                        )
+                        lit_seabed = seabed_albedo * (
+                            seabed_direct / math.pi + sky_radiance[q]
+                        )
+                        seabed = lit_seabed * water_transmission
+
+                        # The old path added a fixed blue value here, making
+                        # water self-emissive on the planet's night side.
+                        # Scattering now consumes only shared incident light.
+                        scattering_albedo = ocean_scattering / ti.max(
+                            water_extinction,
+                            1.0e-6,
+                        )
+                        incident_water_radiance = (
+                            sky_radiance[q]
+                            + direct_irradiance / (4.0 * math.pi)
+                        )
+                        water_scattering = (
+                            incident_water_radiance
+                            * scattering_albedo
+                            * (1.0 - water_transmission)
+                        )
+                        water_body = (seabed + water_scattering) * (
+                            1.0 - fresnel_view
+                        )
+                        color = water_body + reflected_sky + sun_specular
             self.surface_hdr[q] = ti.max(color, 0.0)
 
     def render(
@@ -1275,6 +1574,7 @@ class PlanetRenderer:
         lighting: LightingState,
         surface_albedo: tuple[float, float, float],
         exposure_ev: float,
+        time_seconds: float = 0.0,
     ) -> None:
         self.planet_radius = planet.radius_m
         anchors = self._anchors_host
@@ -1330,7 +1630,30 @@ class PlanetRenderer:
             # then overwrite their incomplete G-buffer values before shading.
             self._raster_depth_direct(True)
             self._resolve_raster(self.debug_view, True)
+        self._snapshot_terrain_gbuffer()
         camera_radius = float(np.linalg.norm(camera.position_global))
+        camera_altitude = camera_radius - planet.radius_m
+        self.ocean_renderer.rasterize(
+            self.depth,
+            self.gbuffer_position,
+            self.gbuffer_normal,
+            self.gbuffer_albedo,
+            self.gbuffer_material_weights,
+            self.gbuffer_height_m,
+            self.gbuffer_water_depth_m,
+            self.gbuffer_seabed_albedo,
+            self.gbuffer_seabed_normal,
+            self.gbuffer_ocean_slope_variance,
+            self.gbuffer_surface_id,
+            self.gbuffer_surface_cell_id,
+            planet.radius_m,
+            camera_altitude,
+            (frame.east, frame.up, frame.north),
+            (r, vu, f),
+            tf,
+            time_seconds,
+            self.debug_view,
+        )
         self.atmosphere_renderer.update(
             planet.radius_m,
             camera_radius,
@@ -1354,6 +1677,21 @@ class PlanetRenderer:
             lighting.solar_irradiance,
             self.atmosphere_renderer.surface_sun_transmittance,
             self.atmosphere_renderer.surface_sky_radiance,
+            tuple(frame.local_to_global_direction(r)),
+            tuple(frame.local_to_global_direction(vu)),
+            tuple(frame.local_to_global_direction(f)),
+            int(self.ocean_renderer.config.enabled),
+            self.ocean_renderer.config.roughness,
+            self.ocean_renderer.config.dielectric_f0,
+            self.ocean_renderer.config.sky_reflection_strength,
+            self.ocean_renderer.config.absorption_per_m,
+            self.ocean_renderer.config.scattering_per_m,
+            self.ocean_renderer.config.max_visible_depth_m,
+            self.ocean_renderer.config.refraction_index,
+            self.ocean_renderer.config.refraction_strength,
+            self.ocean_renderer.config.refraction_max_offset_pixels,
+            math.radians(lighting.sun_angular_radius_degrees),
+            tf,
             self.debug_view,
         )
         self.atmosphere_renderer.composite(

@@ -20,6 +20,9 @@ class AtmosphereDiagnosticView(IntEnum):
     AERIAL_SCATTERING = 5
     AERIAL_TRANSMITTANCE = 6
     SURFACE_MASK = 7
+    AERIAL_FROXEL_ONLY = 8
+    AERIAL_DIRECT_ONLY = 9
+    AERIAL_BLEND_WEIGHT = 10
 
     @property
     def label(self) -> str:
@@ -32,6 +35,9 @@ class AtmosphereDiagnosticView(IntEnum):
             self.AERIAL_SCATTERING: "Aerial scattering",
             self.AERIAL_TRANSMITTANCE: "Aerial transmittance",
             self.SURFACE_MASK: "Surface mask",
+            self.AERIAL_FROXEL_ONLY: "Aerial froxel only",
+            self.AERIAL_DIRECT_ONLY: "Aerial direct only",
+            self.AERIAL_BLEND_WEIGHT: "Aerial blend weight",
         }[self]
 
     @property
@@ -43,6 +49,8 @@ class AtmosphereDiagnosticView(IntEnum):
             self.SKY_VIEW,
             self.MULTI_SCATTERING_LUT,
             self.AERIAL_SCATTERING,
+            self.AERIAL_FROXEL_ONLY,
+            self.AERIAL_DIRECT_ONLY,
         }
 
     @property

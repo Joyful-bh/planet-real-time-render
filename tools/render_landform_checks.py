@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from planet_renderer.cli import initial_state  # noqa: E402
 from planet_renderer.config import load_config  # noqa: E402
+from planet_renderer.ocean import opaque_surface_height_m  # noqa: E402
 from planet_renderer.renderer import PlanetRenderer  # noqa: E402
 from planet_renderer.terrain import CubeSphereTerrain, TerrainSettings  # noqa: E402
 from planet_renderer.terrain_factory import create_terrain_model  # noqa: E402
@@ -122,11 +123,16 @@ def main() -> int:
         config.postprocess,
         config.terrain_max_gpu_patches,
         config.terrain_patch_resolution,
+        config.ocean,
     )
     renderer.debug_view = 0
 
     direction = np.array([0.0, 0.0, 1.0], np.float64)
-    surface_height = terrain.describe_surface(direction).height_m
+    terrain_height = terrain.describe_surface(direction).height_m
+    surface_height = opaque_surface_height_m(
+        terrain_height,
+        config.ocean.enabled,
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     simulated_time = 1.0
     warmed_up = False

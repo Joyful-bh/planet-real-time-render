@@ -7,6 +7,7 @@ import taichi as ti
 from planet_renderer.atmosphere import AtmosphereConfig, AtmosphereDiagnosticView
 from planet_renderer.camera import PlanetCamera
 from planet_renderer.lighting import LightingState
+from planet_renderer.ocean import OCEAN_SURFACE_ID
 from planet_renderer.planet import PlanetModel
 from planet_renderer.postprocess import PostprocessConfig
 from planet_renderer.renderer import PlanetRenderer
@@ -331,10 +332,33 @@ def test_small_cpu_render_has_finite_gbuffer():
         np.testing.assert_allclose(
             view[slot, vertex], (view[slot, a] + view[slot, b]) * 0.5, rtol=0, atol=1e-5
         )
-    hits = renderer.gbuffer_surface_id.to_numpy() >= 0
+    surface_ids = renderer.gbuffer_surface_id.to_numpy()
+    hits = surface_ids >= 0
     assert hits.any()
     albedo = renderer.gbuffer_albedo.to_numpy()[hits]
-    assert np.isfinite(albedo).all() and np.ptp(albedo, axis=0).max() > 0.01
+    assert np.isfinite(albedo).all()
+    ocean_hits = surface_ids == OCEAN_SURFACE_ID
+    assert ocean_hits.any()
+    ocean_heights = renderer.gbuffer_height_m.to_numpy()[ocean_hits]
+    assert np.isfinite(ocean_heights).all()
+    assert np.all(
+        np.abs(ocean_heights)
+        <= renderer.ocean_renderer.max_geometry_displacement_m + 0.05
+    )
+    ocean_depth = renderer.gbuffer_water_depth_m.to_numpy()[ocean_hits]
+    assert np.isfinite(ocean_depth).all()
+    assert np.all(ocean_depth >= 0.0)
+    assert np.all(ocean_depth <= renderer.ocean_renderer.config.max_visible_depth_m)
+    ocean_variance = renderer.gbuffer_ocean_slope_variance.to_numpy()[ocean_hits]
+    assert np.isfinite(ocean_variance).all()
+    assert np.all(ocean_variance >= 0.0)
+    seabed_normals = renderer.gbuffer_seabed_normal.to_numpy()[ocean_hits]
+    assert np.isfinite(seabed_normals).all()
+    assert np.allclose(np.linalg.norm(seabed_normals, axis=1), 1.0, atol=2.0e-3)
+    terrain_hits = hits & ~ocean_hits
+    if terrain_hits.any():
+        terrain_albedo = renderer.gbuffer_albedo.to_numpy()[terrain_hits]
+        assert np.ptp(terrain_albedo, axis=0).max() > 0.01
 
     atmosphere = renderer.atmosphere_renderer
     atmosphere.set_luts_frozen(True)

@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from planet_renderer.cli import initial_state  # noqa: E402
 from planet_renderer.config import load_config  # noqa: E402
+from planet_renderer.ocean import opaque_surface_height_m  # noqa: E402
 from planet_renderer.renderer import PlanetRenderer  # noqa: E402
 from planet_renderer.terrain import CubeSphereTerrain  # noqa: E402
 from planet_renderer.terrain import TerrainSettings
@@ -112,8 +113,12 @@ def make_scene(args: argparse.Namespace):
     )
     direction = camera.position_global / np.linalg.norm(camera.position_global)
     terrain_height = terrain.describe_surface(direction).height_m
+    active_surface_height = opaque_surface_height_m(
+        terrain_height,
+        config.ocean.enabled,
+    )
     camera.position_global = planet.surface_position(
-        direction, terrain_height + max(config.initial_altitude_m, 2.0)
+        direction, active_surface_height + max(config.initial_altitude_m, 2.0)
     )
     if args.altitude_m is not None:
         camera.position_global = planet.surface_position(
@@ -128,6 +133,7 @@ def make_scene(args: argparse.Namespace):
         config.postprocess,
         settings.max_gpu_patches,
         settings.patch_resolution,
+        config.ocean,
     )
     return config, planet, camera, lighting, terrain, renderer
 

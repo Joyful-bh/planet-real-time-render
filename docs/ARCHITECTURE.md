@@ -53,6 +53,66 @@
 
 负责海平面球面、波浪法线、吸收、反射和海岸混合。水体遮挡关系必须与地形高度一致。
 
+在完整 M4 水面材质完成前，稳定管线先提供一个解析海平面覆盖层：它只在地形低于参考半径时把半径 `R` 的球面写入共享 G-buffer，并使用与大气底边界完全相同的球面。执行顺序固定为“地形光栅 -> 海平面深度覆盖 -> 大气查询与合成”。该覆盖层解决可见表面、相机净空和大气光程端点的契约一致性；它不包含波浪、Fresnel、反射或吸收，不能被当作完整海洋渲染。
+
+M4.1 在该覆盖层上使用逐像素解析波浪法线和独立水体 BRDF，不建立第二套海洋网格。波浪相位锚定于行星径向坐标；水体使用介电 Fresnel、GGX 有限太阳高光和共享大气天空辐亮度，并在着色完成后继续经过统一的 Aerial-Perspective 合成。第一阶段不使用额外反射相机或屏幕空间反射，复杂度保持为可见水面像素数量的线性函数。
+
+M4.2 在海平面覆盖发生前保存同一观察射线上的海床命中距离与海床颜色，用水面到海床的视线距离近似水中光程。水体采用逐通道 Beer–Lambert 吸收和有限深度内散射，在浅水中保留海床颜色、在深水中渐近到水体颜色。程序波浪由显式时间输入驱动，并按每像素世界空间足迹衰减无法满足 Nyquist 条件的短波，禁止让远距离高频法线产生摩尔纹。
+
+M4.R0 removes all emissive colour constants from the water path. Water-body
+scattering is parameterized by absorption and scattering coefficients and may
+only redistribute incident solar or atmospheric radiance. The seabed is lit
+before Beer-Lambert transmission; raw seabed albedo never injects night-side
+energy. Solar terms consume the shared finite-disk atmospheric transmittance,
+including planet occlusion, and aerial perspective is applied exactly once
+after surface shading.
+
+M4.R1 separates resolved wave slope from unresolved statistical slope. Bands
+below the pixel footprint fade out of the explicit normal and their
+mean-square slope transfers to the GGX distribution. Solar angular radius also
+contributes to the minimum lobe variance. The space view therefore converges
+to a statistical ocean BRDF rather than sampling sub-pixel periodic phase.
+Future FFT/JONSWAP cascades must preserve this resolved-gradient and
+unresolved-variance contract.
+
+M4.R2 replaces per-water-pixel trigonometric wave evaluation with a shared
+three-cascade directional spectrum. Each frame synthesizes periodic height and
+gradient fields for swell, wind-wave and ripple scales. Planet-anchored phase
+offsets are calculated in CPU float64 and only reduced local coordinates reach
+GPU float32. Surface cost is therefore a fixed number of filtered texture
+samples, independent of spectral mode count. The current inverse spectral sum
+is the deterministic real-time backend; an FFT/JONSWAP generator may replace
+the field producer without changing consumers.
+
+M4.R3 gives the two lowest-frequency cascades geometric authority near the
+camera. The analytic spherical hit is refined against the displaced radius,
+so position, depth, water path length and limb silhouette use the same wave
+height as shading. Refinement is capped by `geometry_max_distance_m`; beyond
+that range the renderer immediately returns to the mean sea-level sphere and
+transfers unresolved slope energy to the BRDF. This keeps space-view cost
+constant and avoids creating a second planet-wide triangle LOD hierarchy.
+
+M4.R4 adds bounded choppy displacement to the same spectrum contract. Each
+cascade stores horizontal displacement and its 2x2 Jacobian. Coverage locally
+inverts `x = q + D(q)` before evaluating height, and the shading gradient uses
+the inverse-transpose Jacobian. `choppiness` is restricted to `0..1`; the
+inverse determinant has a safety floor so the stable path cannot create a
+folded multi-valued surface.
+
+M4.R5 retains a pre-ocean opaque-terrain G-buffer and performs bounded
+screen-space refraction for visible water. The air-to-water ray uses
+`refraction_index`, projects a depth-limited endpoint, and bilinearly samples
+only valid terrain behind the water. Invalid, off-screen or disoccluded hits
+fall back to the same-pixel seabed sample. This is a forward-rendered shallow
+water approximation, not an underwater ray tracer.
+
+Sea-level existence and water-material quality are separate contracts.
+`ocean.surface_enabled` controls the radius-R opaque boundary used by coverage,
+camera clearance and atmosphere termination. `ocean.enabled` controls waves,
+choppy displacement, refraction and the water BRDF. With `surface_enabled=true`
+and `enabled=false`, the renderer intentionally keeps a flat, fixed-colour
+Lambert surface at sea level; it must not expose negative-height seabed.
+
 ### `atmosphere`
 
 负责密度、消光、散射、LUT 和空气透视。直接单次散射积分是验证基准；实时默认路径逐步迁移到 LUT。不得包含云密度或地形材质。

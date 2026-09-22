@@ -931,10 +931,11 @@ of subtracting two squared million-metre quantities. The old 3-D aerial
 transmittance field and its internal API were removed rather than retained as a
 second, inconsistent source of truth.
 
-New quality controls are `aerial_horizon_raymarch_steps`,
-`aerial_horizon_inner_cosine` and `aerial_horizon_outer_cosine`. The two cosine
-values define the smooth direct-to-froxel transition; they are not angular
-resolution multipliers.
+The direct reference integrator is controlled by
+`aerial_horizon_raymarch_steps` and `aerial_terminator_substeps`. The former
+direct-to-froxel cosine controls were removed after visual diagnosis proved
+that the screen-space froxel estimator itself was not acceptable for final
+surface composition.
 
 The focused CPU render regression compiles both raster paths and every
 atmosphere diagnostic with the refactored kernels, checks finite HDR/display
@@ -1026,3 +1027,239 @@ black Camera-T samples. If CUDA visual acceptance finds only a residual smooth
 terminator bias, that locator should next receive an altitude-relative form;
 it must not be addressed by restoring duplicated ground tests or full-screen
 high-count marching.
+
+### Opaque-surface contract follow-up
+
+The first fix removed the sub-metre radius precision loss, but interactive
+acceptance still showed broad horizontal layers and a pure black horizon over
+regions coloured as ocean. The remaining defect was not another LUT sampling
+problem. The procedural terrain can be roughly five kilometres below the
+reference radius, while the atmosphere treats that same reference radius as
+its opaque lower boundary. No water surface existed at the reference radius,
+so the G-buffer exposed the seabed and background through a region that the
+atmosphere geometry considered solid ground. Surface Aerial endpoints,
+Sky-view ground hits, camera clearance and the visible surface therefore
+described different worlds.
+
+The renderer now has a deliberately minimal analytic sea-level coverage pass.
+After terrain rasterization it intersects each camera ray with the sphere at
+the planet reference radius and overwrites only empty pixels or terrain behind
+that sphere. It writes the shared depth, position, radial normal, height and
+surface identity before any atmosphere lookup. Terrain above sea level remains
+unchanged; negative terrain becomes seabed hidden by the coverage sphere.
+Camera placement and movement use the same active surface
+`max(terrain_height, 0)` while ocean coverage is enabled, so a requested
+0.5-2 m altitude is clearance above water rather than several kilometres above
+the seabed.
+
+Source compilation, all three preset parses and the integrated CPU render
+kernel compile path cover the new pass. The prior focused render reached and
+executed the ocean kernel; its only failure was an obsolete assertion expecting
+terrain-colour variation even when the complete tiny test viewport was covered
+by water. The regression now checks finite ocean G-buffer values and exact
+zero sea-level height. Final CUDA visual acceptance at the reported 0.5 m,
+323 m and dawn/dusk views remains user-run.
+
+This coverage pass intentionally uses a simple diffuse placeholder colour. It
+does not close M4: waves, Fresnel reflection, absorption, coastline treatment
+and the final ocean BRDF remain future work. Those effects must consume this
+same sea-level geometry and shared atmosphere/lighting state rather than
+creating a second water sphere or a second ground-hit test.
+
+### Screen-space scattering diagnostic follow-up
+
+Interactive isolation found that the remaining dawn/dusk bands are present in
+`Aerial scattering`, absent from `Aerial transmittance`, move with the camera
+view and do not match terrain height, LOD, patch identity or surface coverage.
+This localizes the defect to scattering reconstruction or the froxel/direct
+blend rather than geometry, material, solar-disk rendering or transmittance.
+
+Three non-physical diagnostic outputs were added without changing Composite:
+`Aerial froxel only` shows the trilinearly reconstructed low-resolution volume,
+`Aerial direct only` evaluates the direct camera-to-surface integrator for all
+surface pixels, and `Aerial blend weight` displays the exact scalar weight used
+to combine them. The direct-only view is intentionally expensive and exists
+only for diagnosis. Comparing these views at one frozen camera/LUT state will
+distinguish froxel undersampling, direct-integration banding and disagreement
+between otherwise smooth estimators.
+
+Visual comparison confirmed the diagnosis: `Froxel only` reproduced the
+view-locked bands, `Direct only` was smooth, and Aerial transmittance remained
+smooth. The final surface Aerial path therefore no longer samples or blends
+the screen-space froxel volume. It uses the verified direct camera-to-surface
+integrator for every opaque surface pixel. This removes the estimator boundary
+as well as the undersampled source of the bands; `Aerial blend weight` is now
+white on surface pixels because the direct contribution is exactly one.
+
+The froxel volume is retained only as a diagnostic/reference implementation.
+This prioritizes correctness and establishes the direct result as the reference
+for a future performance replacement. Any later cached approximation must be
+parameterized independently of the coarse screen grid and validated against
+the direct view before it can replace this path.
+
+## ISSUE-0024: Sea-level coverage looked flat and analytic waves aliased
+
+- Status: `M4.R0-R1 implemented; visual acceptance pending`
+- Phase: M4 spherical ocean
+- Symptom: the analytic sea-level sphere fixed atmosphere/coverage consistency
+  but still looked like a uniformly blue board, with no angular reflection,
+  wave highlights or recognizable water response.
+- Root cause: ocean pixels used the terrain Lambert shader with a constant blue
+  albedo and an unperturbed radial normal.
+
+### Fix
+
+Ocean coverage remains an analytic sphere and therefore adds no mesh, patch or
+triangle workload. Its GPU coverage kernel now evaluates four fixed analytic
+directional waves anchored in planet coordinates and writes a normalized water
+shading normal. The shared surface shader recognizes `OCEAN_SURFACE_ID` and
+uses a dielectric Schlick Fresnel term, GGX sun reflection, atmospheric solar
+transmittance, shared sky radiance and a small transmitted water-body term.
+The result is then passed through the same camera-to-surface atmosphere path as
+terrain. Cost is bounded per visible ocean pixel: four sine evaluations and
+one compact BRDF, with no reflection camera, SSR ray march, FFT or readback.
+
+### Verification and remaining work
+
+Source compilation and all preset configuration parsing pass. A 4x4 CPU
+Taichi smoke run JIT-compiled the coverage/wave-normal kernel, produced ocean
+hits and verified unit-length finite normals. Full visual acceptance remains
+user-run.
+
+The first visual M4.1 run exposed severe view-distance moire and visibly static
+waves. M4.2 now passes an explicit preview time into the renderer rather than
+creating hidden renderer clock state. Deep-water dispersion supplies each
+wave's phase speed. The ocean kernel estimates the projected world-space pixel
+footprint and smoothly removes wavelengths with fewer than two-to-six samples,
+so distant waves converge to the radial normal instead of aliasing.
+
+Before overwriting terrain G-buffer values, the ocean pass also preserves the
+terrain hit distance and albedo behind the water. Their distance difference is
+a bounded view-path water depth. The BRDF applies per-channel Beer–Lambert
+absorption to the seabed and adds water-body in-scattering as transmission is
+lost. Missing or more distant seabed data cleanly saturates at
+`max_visible_depth_m`. A combined 4x4 CPU Taichi smoke test JIT-compiled the
+updated coverage and BRDF kernels and checked finite, bounded depth output.
+
+The depth is presently a straight view-path approximation without refraction.
+Directional Sky-view reflection, foam, shoreline distance fields and geometric
+displacement remain later M4 work. The explicit time scalar should be replaced
+by the canonical `TimeState.world_time_seconds` when that producer is added;
+the ocean shader itself does not own a clock.
+
+### M4.R0-R1 energy and footprint correction
+
+Visual inspection exposed two related failures: water remained blue on the
+unlit hemisphere and the low-count analytic wave bank produced coherent moire
+and an oversized solar glint at altitude. The night-side energy was not an
+atmosphere defect. `in_scatter_color` was a constant radiance-like term, and
+the preserved seabed value was raw albedo; both entered the result without
+requiring incident light.
+
+`in_scatter_color` has been removed from the stable presets. Water now stores
+non-negative `scattering_per_m`, combines it with absorption to form
+extinction, and derives in-scattering exclusively from shared direct-sun and
+atmospheric radiance. The preserved seabed normal lights its albedo before
+water transmission. With zero solar and sky input, reflection, seabed and
+volume terms are all exactly zero. The atmosphere's finite-disk solar
+transmittance remains the single source of planet occlusion; ocean does not
+derive a second sun state.
+
+The temporary analytic bank now spans eight non-orthogonal, non-harmonic
+bands. Footprint filtering returns both a resolved normal and removed
+mean-square slope. The latter broadens the GGX distribution, while finite
+solar-disk variance supplies a lower lobe bound. Distant bands retain average
+energy without retaining aliased phase. This is a bounded interim spectrum,
+not the future geometric FFT/JONSWAP implementation.
+
+Verification was intentionally limited to source/config parsing and the
+existing 64x48 CPU integration smoke test. It JIT-compiled the updated ocean
+coverage and surface kernels and passed finite G-buffer/HDR checks. Final
+visual acceptance of night-side darkness, horizon continuity and space-view
+sunglint remains user-run. Directional reflected-sky lookup, refraction,
+near-field displaced geometry and spectral FFT cascades remain explicit later
+M4 work.
+
+## ISSUE-0025: Per-pixel waves had no geometric near field
+
+- Status: `M4.R2-R5 implemented; visual acceptance pending`
+- Phase: M4 spherical ocean
+- Symptom: increasing the analytic wave count would make the middle distance
+  increasingly expensive while the close surface remained a smooth sphere.
+  Shading normals could not create wave parallax, displaced depth, a moving
+  waterline or a non-flat horizon.
+- Root cause: spectral evaluation and representation were both tied to the
+  final ocean pixel. There was no shared wave field and the coverage equation
+  always intersected exactly `radius_m`.
+
+### Fix
+
+The ocean now synthesizes three directional periodic bands once per frame at
+the configured `spectrum_resolution`. Twelve deterministic spectral modes per
+band produce height and analytic gradient fields spanning roughly 512 m, 64 m
+and 8 m dominant wavelengths. Wind speed controls amplitude and dispersion;
+wind direction rotates the stable global sampling frames. CPU float64 computes
+the planet-anchored phase remainder before upload, avoiding Earth-radius phase
+loss in GPU float32. Per visible pixel the mode sum is replaced by bounded
+bilinear field samples.
+
+The two lowest bands also displace coverage within
+`geometry_max_distance_m`. Three fixed-point refinements solve the camera ray
+against `R + wave_height`; the resulting position is written to depth and is
+used for seabed optical distance. Rays just outside the mean sphere may start
+from a conservative crest sphere. Outside the geometry range, including space
+views, refinement is skipped completely and the existing footprint/statistical
+BRDF path remains active.
+
+Configuration exposes `spectrum_resolution`, `wind_speed_mps`,
+`wind_direction_degrees`, `wave_height_scale`, `geometry_cascades` and
+`geometry_max_distance_m`. This backend is deliberately replaceable: a later
+FFT/JONSWAP implementation writes the same height/gradient cascade fields.
+
+M4.R4 adds horizontal displacement and an analytic displacement Jacobian to
+each cascade. The implicit surface inverts the horizontal map with two bounded
+iterations, then transforms its height gradient through the inverse Jacobian.
+This sharpens crests and broadens troughs while retaining the existing
+planet-scale ray intersection and footprint filtering.
+
+M4.R5 snapshots opaque terrain before ocean coverage. The water shader
+refracts the view ray using Snell's law, projects a bounded screen-space
+endpoint and bilinearly reconstructs only valid terrain samples behind the
+water. Missing and disoccluded samples retain the original same-pixel seabed,
+so refraction cannot introduce black holes at screen edges or shorelines.
+
+### Verification and limits
+
+All three stable presets parse, Python source compilation passes, and the
+existing 64x48 CPU integration smoke test JIT-compiled spectrum synthesis,
+displaced coverage, choppy inversion and refraction, then passed its finite
+depth, height, normal, variance and HDR assertions. Final animation and
+scale-transition acceptance is user-run. Breaking-wave foam, directional
+reflected-sky lookup and shoreline wave attenuation remain later work.
+
+## ISSUE-0026: Disabling the water material removed the sea-level boundary
+
+- Status: `fixed; visual acceptance pending`
+- Phase: M4 spherical ocean
+- Symptom: setting `ocean.enabled=false` exposed negative-height seabed again,
+  restoring the low-altitude black horizon and colour bands previously fixed
+  by the radius-R sea-level coverage layer.
+- Root cause: one boolean controlled two independent responsibilities. It
+  disabled both the advanced water material and the physical sea-level
+  surface, while the atmosphere continued to use radius R as its lower
+  boundary. Visible surface, camera clearance and atmosphere termination were
+  therefore no longer the same surface.
+
+### Fix
+
+`surface_enabled` now exclusively controls whether the radius-R sea-level
+surface exists. `enabled` controls only spectrum synthesis, displacement,
+refraction and advanced water BRDF shading. Camera placement consumes
+`surface_enabled`. When the surface exists but the advanced material is off,
+ocean coverage still writes the shared G-buffer with a radial normal and fixed
+albedo, and the ordinary Lambert surface shader handles it.
+
+Python compilation and stable preset parsing were used as the targeted check;
+the low-altitude visual comparison remains user-run. Setting
+`surface_enabled=false` is intentionally the explicit airless/dry-planet path
+and may expose negative terrain if that terrain generator contains it.
