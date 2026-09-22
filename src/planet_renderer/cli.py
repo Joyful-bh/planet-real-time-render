@@ -500,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
             config.terrain_max_gpu_patches,
             config.terrain_patch_resolution,
             config.ocean,
+            config.space,
         )
         # 两个固定预算 bootstrap tick 使六个根 patch 可作为初始 fallback；不等待细分完成。
         renderer.apply_terrain_frame(

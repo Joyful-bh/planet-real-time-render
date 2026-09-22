@@ -23,6 +23,7 @@ from .lighting import LightingState
 from .ocean import OCEAN_SURFACE_ID, OceanConfig, OceanRenderer
 from .planet import PlanetModel
 from .postprocess import PostprocessConfig, PostProcessor
+from .space import SpaceConfig, SpaceRenderer
 from .terrain_lod import cube_face_direction
 from .terrain_renderer import TerrainRenderer
 from .terrain_types import PatchKey, TerrainFrame, TerrainPatchRenderDescriptor
@@ -113,6 +114,7 @@ class PlanetRenderer:
         max_patches: int = 256,
         patch_resolution: int = 12,
         ocean_config: OceanConfig | None = None,
+        space_config: SpaceConfig | None = None,
     ):
         self.width, self.height = width, height
         self.max_patches = max_patches
@@ -145,6 +147,11 @@ class PlanetRenderer:
             width,
             height,
             ocean_config or OceanConfig(),
+        )
+        self.space_renderer = SpaceRenderer(
+            width,
+            height,
+            space_config or SpaceConfig(),
         )
         self.postprocessor = PostProcessor(width, height, postprocess_config)
         self.local_triangles = ti.Vector.field(
@@ -1694,8 +1701,15 @@ class PlanetRenderer:
             tf,
             self.debug_view,
         )
+        global_view_basis = (
+            frame.local_to_global_direction(r),
+            frame.local_to_global_direction(vu),
+            frame.local_to_global_direction(f),
+        )
+        self.space_renderer.render(global_view_basis, tf)
         self.atmosphere_renderer.composite(
             self.surface_hdr,
+            self.space_renderer.hdr,
             self.gbuffer_surface_id,
             self.gbuffer_position,
             self.hdr,
@@ -1707,6 +1721,8 @@ class PlanetRenderer:
             lighting.sun_angular_radius_degrees,
             (r, vu, f),
             tf,
+            self.space_renderer.config.contrast_start,
+            self.space_renderer.config.contrast_end,
             self.atmosphere_diagnostic_view,
         )
         diagnostic = self.atmosphere_diagnostic_view

@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["taichi>=1.7,<2", "numpy>=1.24"]
 
+[project.optional-dependencies]
+assets = ["Pillow>=9.1"]
+
 [project.scripts]
 planet-render = "planet_renderer.cli:main"
 

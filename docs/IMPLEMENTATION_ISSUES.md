@@ -1263,3 +1263,60 @@ Python compilation and stable preset parsing were used as the targeted check;
 the low-altitude visual comparison remains user-run. Setting
 `surface_enabled=false` is intentionally the explicit airless/dry-planet path
 and may expose negative terrain if that terrain generator contains it.
+
+## ISSUE-0027: Stellar visibility must not be a hard day/night state
+
+- Status: `Hipparcos hybrid catalogue integrated; visual calibration pending`
+- Phase: M5 time, celestial motion and star field
+- Symptom: the renderer had a black space background and no stable way to add
+  stars without making them visible through the daytime atmosphere.
+- Root cause: no `space` radiance producer existed. A binary test based on sun
+  elevation would also disagree between ground and space viewpoints and would
+  bypass physical atmospheric extinction.
+
+### Fix
+
+`SpaceRenderer` now creates a seeded global-frame catalogue with isotropic
+directions, a continuous apparent-magnitude distribution, approximate linear
+black-body colours and bounded Gaussian point-spread radii. It renders a
+sparse linear-HDR star buffer and does not make any day/night decision.
+
+The atmosphere Composite pass attenuates that buffer with the existing
+camera-to-space RGB transmittance. A smooth star-to-Sky-View luminance contrast
+response suppresses stars in a bright daytime sky and reveals them as the
+background darkens; space needs no special branch. Surface pixels never
+consume the star buffer, and ground-intersecting sky rays receive zero
+transmittance, so stars cannot show through the planet. Parameters are grouped
+under `space` in all stable presets.
+
+Targeted validation covers Python compilation, JSON/config parsing, catalogue
+determinism, finite normalized directions and non-negative radiance. The first
+implementation used a procedural catalogue without a Galactic background; it
+is retained as the missing-asset fallback described below. Visual calibration
+of density, magnitude and contrast at ground/night, twilight, high atmosphere
+and space remains user-run.
+
+### Catalogue and Galactic-background follow-up
+
+The procedural catalogue is now only a missing-asset fallback. The offline
+`tools/build_space_assets.py` path converts Hipparcos into 117,955 valid ICRS
+position/photometry records. The V=6.5 point split keeps 8,870 bright stars as
+individual HDR PSFs; the remaining 109,085 stars are prefiltered into a
+4096x2048 RGBE celestial texture. This avoids scaling the per-frame atomic
+splat workload with the complete catalogue while retaining precise bright-star
+positions and colours. B-V produces a restrained black-body colour, and visual
+magnitude remains the stellar intensity input.
+
+The ESO/S. Brunier panorama is linearized, black-level corrected, point-source
+suppressed and stored as a 2048x1024 compact cache. Runtime transforms the
+same ICRS ray into Galactic coordinates and samples the panorama as diffuse
+radiance before the existing atmosphere visibility composite. Stable presets
+expose asset paths, magnitude cutoff, panorama radiance, longitude offset and
+handedness. Source provenance, hashes and attribution are recorded in
+`assets/space/SOURCES.md`.
+
+Python compilation, all stable configuration loads, catalogue/texture finite
+checks and a 96x54 CPU Taichi projection smoke test pass. Exact panorama
+longitude handedness and artistic radiance calibration remain visual checks;
+the explicit offset/flip controls exist for that calibration. Time-dependent
+sidereal rotation remains owned by the future `celestial` producer.

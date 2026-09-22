@@ -15,6 +15,28 @@
     "sun_angular_radius_degrees": 0.266,
     "solar_irradiance": [4.0, 3.9, 3.7]
   },
+  "space": {
+    "enabled": true,
+    "catalog_path": "assets/space/runtime/hipparcos_stars.npz",
+    "catalog_magnitude_limit": 6.5,
+    "seed": 2027,
+    "star_count": 8000,
+    "radiance_scale": 0.08,
+    "minimum_magnitude": -1.5,
+    "maximum_magnitude": 6.5,
+    "minimum_radius_pixels": 0.55,
+    "maximum_radius_pixels": 1.45,
+    "contrast_start": 2.0,
+    "contrast_end": 8.0,
+    "milky_way_enabled": true,
+    "milky_way_texture_path": "assets/space/runtime/milky_way_2048x1024.npz",
+    "milky_way_radiance_scale": 0.006,
+    "milky_way_longitude_offset_degrees": 0.0,
+    "milky_way_flip_longitude": true,
+    "faint_star_texture_enabled": true,
+    "faint_star_texture_path": "assets/space/runtime/hipparcos_faint_4096x2048.npz",
+    "faint_star_radiance_scale": 0.65
+  },
   "postprocess": {
     "exposure_ev": 0.75,
     "bloom_threshold": 1.0,

@@ -7,6 +7,7 @@ from pathlib import Path
 from .atmosphere import AtmosphereConfig
 from .ocean import OceanConfig
 from .postprocess import PostprocessConfig
+from .space import SpaceConfig
 from .terrain_config import TerrainConfig
 
 CURRENT_CONFIG_VERSION = 3
@@ -31,6 +32,7 @@ class M0Config:
     atmosphere: AtmosphereConfig = field(default_factory=AtmosphereConfig)
     ocean: OceanConfig = field(default_factory=OceanConfig)
     postprocess: PostprocessConfig = field(default_factory=PostprocessConfig)
+    space: SpaceConfig = field(default_factory=SpaceConfig)
     terrain: TerrainConfig = field(default_factory=TerrainConfig)
     terrain_patch_resolution: int = 12
     terrain_max_level: int = 16
@@ -60,7 +62,7 @@ def load_config(path: Path) -> M0Config:
             "v3 removes lighting.sun_disk_radiance and moves exposure_ev "
             "from rendering to postprocess"
         )
-    r, p, c, l, a, o, pp, t = (
+    r, p, c, l, a, o, pp, s, t = (
         data.get(k, {})
         for k in (
             "rendering",
@@ -70,6 +72,7 @@ def load_config(path: Path) -> M0Config:
             "atmosphere",
             "ocean",
             "postprocess",
+            "space",
             "terrain",
         )
     )
@@ -97,6 +100,7 @@ def load_config(path: Path) -> M0Config:
         atmosphere=AtmosphereConfig.from_mapping(a),
         ocean=OceanConfig.from_mapping(o),
         postprocess=PostprocessConfig.from_mapping(pp),
+        space=SpaceConfig.from_mapping(s),
         terrain=TerrainConfig(
             generator=t.get("generator", "procedural_fbm_v1"),
             params=t.get("params", {}),

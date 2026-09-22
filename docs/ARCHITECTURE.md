@@ -412,3 +412,41 @@ depth rather than generating background sky. A future full-resolution sky
 integrator requires stochastic sampling plus temporal reconstruction and must
 be introduced as a measured replacement for Sky-View, not blended into it as a
 second simultaneous source of truth.
+
+### M5 procedural stellar background
+
+The initial `space` implementation owns a deterministic, isotropic catalogue
+of global-frame star directions, linear radiance and sub-pixel PSF radii. It
+does not own a day/night switch and it does not include the sun. Each frame
+projects the immutable catalogue into a sparse HDR buffer; atmosphere
+composition then evaluates
+`sky + T_camera_to_space * stars + T_camera_to_space * sun`.
+
+Star visibility is a smooth radiance-contrast response against the local
+Sky-View luminance. Consequently stars remain present in space, are attenuated
+near an atmospheric horizon, emerge continuously as the sky darkens, and are
+suppressed by a bright daytime sky without consulting solar elevation. Planet
+occlusion follows the same surface mask and zero ground-ray transmittance used
+by the rest of the atmosphere. The fallback catalogue seed, density, magnitude
+range, PSF range and contrast response are exposed under `space`; the stable
+presets now select compact astronomical assets while a missing catalogue still
+falls back to the deterministic procedural source.
+
+M5.1 replaces that source when compact assets are present. An offline tool
+converts Hipparcos ICRS right ascension/declination, V magnitude and B-V colour
+to normalized directions, linear colour and magnitude arrays. Stars through
+V=6.5 remain projected point sources. The other 109,085 usable records are
+baked into a 4096x2048 RGBE celestial texture with a small reconstruction
+footprint, so their runtime cost is one texture lookup per output pixel rather
+than a catalogue traversal and 25 atomic PSF splats per source. Both layers
+remain linear HDR before atmosphere composition. Missing assets fall back to
+the seeded catalogue rather than making startup fail.
+
+M5.2 preprocesses the ESO/S. Brunier Galactic panorama in linear space. It
+subtracts the photographic black level, suppresses resolvable point sources,
+downsamples to a compact 2:1 texture and stores an sRGB-encoded NPZ cache.
+Runtime decoding occurs before GPU upload, so bilinear sampling operates on
+linear radiance. View rays are transformed by the standard ICRS-to-Galactic
+rotation before equirectangular lookup; stars and the diffuse Galaxy therefore
+share one celestial frame. Orientation correction and radiance scale remain
+explicit configuration because panorama conventions are not universal.

@@ -1828,6 +1828,7 @@ class AtmosphereRenderer:
     def _composite(
         self,
         scene_hdr: ti.template(),
+        space_hdr: ti.template(),
         surface_id: ti.template(),
         position_view: ti.template(),
         hdr: ti.template(),
@@ -1842,6 +1843,8 @@ class AtmosphereRenderer:
         view_up: ti.types.vector(3, ti.f32),
         forward: ti.types.vector(3, ti.f32),
         tangent_half_fov: ti.f32,
+        star_contrast_start: ti.f32,
+        star_contrast_end: ti.f32,
         diagnostic_view: ti.i32,
     ):
         aspect = ti.cast(self.width, ti.f32) / self.height
@@ -1882,14 +1885,36 @@ class AtmosphereRenderer:
                         ray,
                         bottom_radius,
                     )
+                    sky_radiance = self._sample_sky_view(
+                        ray,
+                        sun_local,
+                        sky_lut_camera_altitude,
+                        bottom_radius,
+                    )
+                    star_radiance = space_hdr[pixel] * transmission
+                    sky_luminance = sky_radiance.dot(
+                        ti.Vector([0.2126, 0.7152, 0.0722])
+                    )
+                    star_luminance = star_radiance.dot(
+                        ti.Vector([0.2126, 0.7152, 0.0722])
+                    )
+                    contrast = star_luminance / ti.max(sky_luminance, 1.0e-5)
+                    star_visibility = ti.math.clamp(
+                        (contrast - star_contrast_start)
+                        / ti.max(
+                            star_contrast_end - star_contrast_start,
+                            1.0e-5,
+                        ),
+                        0.0,
+                        1.0,
+                    )
+                    star_visibility = star_visibility * star_visibility * (
+                        3.0 - 2.0 * star_visibility
+                    )
                     color = (
-                        self._sample_sky_view(
-                            ray,
-                            sun_local,
-                            sky_lut_camera_altitude,
-                            bottom_radius,
-                        )
+                        sky_radiance
                         + color * transmission
+                        + star_radiance * star_visibility
                     )
                     angular_distance = ti.acos(
                         ti.math.clamp(ray.dot(sun_local), -1.0, 1.0)
@@ -2164,6 +2189,7 @@ class AtmosphereRenderer:
     def composite(
         self,
         scene_hdr,
+        space_hdr,
         surface_id,
         position_view,
         hdr,
@@ -2175,6 +2201,8 @@ class AtmosphereRenderer:
         sun_angular_radius_degrees: float,
         view_basis: tuple[np.ndarray, np.ndarray, np.ndarray],
         tangent_half_fov: float,
+        star_contrast_start: float,
+        star_contrast_end: float,
         diagnostic_view: AtmosphereDiagnosticView = (
             AtmosphereDiagnosticView.COMPOSITE
         ),
@@ -2189,6 +2217,7 @@ class AtmosphereRenderer:
             sky_lut_camera_altitude = self.sky_snapshot_altitude_m
         self._composite(
             scene_hdr,
+            space_hdr,
             surface_id,
             position_view,
             hdr,
@@ -2203,5 +2232,7 @@ class AtmosphereRenderer:
             tuple(float(value) for value in view_up),
             tuple(float(value) for value in forward),
             float(tangent_half_fov),
+            float(star_contrast_start),
+            float(star_contrast_end),
             int(diagnostic_view),
         )
